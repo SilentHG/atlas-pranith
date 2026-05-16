@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: atlas_timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: atlas
+    ports:
+      - "5433:5432"
+    volumes:
+      - atlas_pgdata:/var/lib/postgresql/data
+      - ./atlas/data/storage/init_timescale.sql:/docker-entrypoint-initdb.d/01_init_timescale.sql
+      - ./atlas/data/storage/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d atlas" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7
+    container_name: atlas_redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - atlas_redisdata:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  atlas_pgdata:
+    driver: local
+  atlas_redisdata:
+    driver: local
