@@ -66,7 +66,7 @@ class CapitalPreservationEngine(BaseAgent):
             r = await conn.execute(
                 text("""
                     SELECT COALESCE(SUM(pnl), 0),
-                           COALESCE(SUM(CASE WHEN side = 'long' THEN qty * avg_price ELSE 0 END), 0)
+                           COALESCE(SUM(CASE WHEN side = 'long' THEN qty * price ELSE 0 END), 0)
                     FROM paper_trades
                 """)
             )

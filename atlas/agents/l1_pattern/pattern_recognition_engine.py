@@ -34,6 +34,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
+from atlas.core.serialization import safe_json_dumps
 
 try:
     from sklearn.ensemble import IsolationForest
@@ -364,7 +365,13 @@ class PatternRecognitionEngine(BaseAgent):
                 pattern_type = d["pattern_type"]
                 symbol = d.get("symbol", "all")
                 confidence = d["confidence"]
-                archetype = d.get("direction", ["unknown"])[0] if isinstance(d.get("direction"), list) else d.get("direction", "unknown")
+                direction = d.get("direction")
+                if isinstance(direction, list) and len(direction) > 0:
+                    archetype = direction[0]
+                elif isinstance(direction, str):
+                    archetype = direction
+                else:
+                    archetype = "unknown"
 
                 await self.db._execute_insert(
                     """
@@ -391,7 +398,7 @@ class PatternRecognitionEngine(BaseAgent):
                         "csa": d.get("avg_anomaly_return", d.get("avg_cluster_return", 0)),
                         "cs": confidence,
                         "rec": d.get("detail", ""),
-                        "md": json.dumps({k: v for k, v in d.items() if k not in ("pattern_type", "confidence", "detail")}),
+                        "md": safe_json_dumps({k: v for k, v in d.items() if k not in ("pattern_type", "confidence", "detail")}),
                     },
                 )
             except Exception as e:

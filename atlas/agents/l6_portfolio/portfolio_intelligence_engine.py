@@ -411,7 +411,7 @@ class PortfolioIntelligenceEngine(BaseAgent):
                      concentration_risk, diversification_score,
                      metadata)
                 VALUES
-                    (:id, :computed_at::timestamptz, :n_strategies, :strategy_ids,
+                    (:id, :computed_at, :n_strategies, :strategy_ids,
                      :correlation_matrix, :covariance_matrix, :cluster_map,
                      :efficiency_scores, :optimal_allocations,
                      :regime_conditioned_weights,

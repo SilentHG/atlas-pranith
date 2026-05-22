@@ -157,7 +157,7 @@ class CopyDriftEngine(BaseAgent):
                  :sym_drift, :timing_ms,
                  :slip_amp, :pf_div,
                  :sync_q, :repair,
-                 :metadata::jsonb, NOW())
+                 CAST(:metadata AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],

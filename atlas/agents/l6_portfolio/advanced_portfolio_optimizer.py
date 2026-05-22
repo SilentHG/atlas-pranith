@@ -86,7 +86,7 @@ class AdvancedPortfolioOptimizer(BaseAgent):
                  final_allocations, method_scores, details)
             VALUES
                 (:id, NOW(), :method, :n_strategies,
-                 :allocations::jsonb, :scores::jsonb, :details::jsonb)
+                 CAST(:allocations AS jsonb), CAST(:scores AS jsonb), CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

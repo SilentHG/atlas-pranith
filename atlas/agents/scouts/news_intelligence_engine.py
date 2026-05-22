@@ -149,7 +149,7 @@ class NewsIntelligenceEngine(BaseAgent):
                  hypothesis_score, signal_direction, mentioned_tickers, details)
             VALUES
                 (:id, :source, :source_sub, NOW(), :sentiment,
-                 :score, :direction, :tickers, :details::jsonb)
+                 :score, :direction, :tickers, CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

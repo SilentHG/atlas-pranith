@@ -102,7 +102,7 @@ class CopyAnalyticsEngine(BaseAgent):
                 (:id, :trace_id, :lid, :fid,
                  :lat, :sync_q, :slip, :exec_div, :pnl_div,
                  :replay, :drift, :surv, :n_events,
-                 :meta::jsonb, NOW())
+                 CAST(:meta AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],

@@ -458,9 +458,9 @@ Output JSON:
                      source_signals, advisory_only, metadata, created_at)
                 VALUES
                     (:id, :trace_id, :confidence, :summary,
-                     :agreement, :disagreements::jsonb,
-                     :interpretation, :weights::jsonb,
-                     :signals::jsonb, TRUE, :metadata::jsonb, NOW())
+                     :agreement, CAST(:disagreements AS jsonb),
+                     :interpretation, CAST(:weights AS jsonb),
+                     CAST(:signals AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

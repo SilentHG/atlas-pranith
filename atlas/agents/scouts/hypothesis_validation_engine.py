@@ -79,7 +79,7 @@ class HypothesisValidationEngine(BaseAgent):
                  hypothesis_score, signal_direction, details)
             VALUES
                 (:id, 'hypothesis_validation', 'summary', NOW(), :sentiment,
-                 :score, 'neutral', :details::jsonb)
+                 :score, 'neutral', CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

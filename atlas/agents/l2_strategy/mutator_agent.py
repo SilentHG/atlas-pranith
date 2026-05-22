@@ -131,6 +131,8 @@ def standardized_similarity(a: dict, b: dict) -> float:
     return jaccard_distance
 
 
+
+
 def deterministic_micro_mutations(spec: dict, max_variants: int = 7) -> list[dict]:
     """
     Generate rule-based micro-mutations from a strategy spec.
@@ -516,6 +518,7 @@ class MutatorAgent(BaseAgent):
             existing_mutants = await self._get_recent_mutants(limit=50)
 
             for candidate in candidates:
+                mutated_ids = []  # Reset per candidate
                 try:
                     await self._process_candidate(candidate, existing_mutants)
                 except Exception as e:
@@ -574,6 +577,8 @@ class MutatorAgent(BaseAgent):
             pass
 
         # Economic mutation bias: favor hold_time/cooldown adjustments in stressed conditions
+
+
         favor_economic = (
             scout_liquidity_regime in ("thin", "dangerous") or
             scout_execution_regime in ("degraded", "stressed", "unstable") or
@@ -587,9 +592,40 @@ class MutatorAgent(BaseAgent):
         # --- Phase 1: Deterministic micro-mutations ---
         deterministic_variants = deterministic_micro_mutations(params, max_variants=used_max_variants)
 
-        # --- Phase 1: Deterministic micro-mutations ---
-        deterministic_variants = deterministic_micro_mutations(params)
+        # Initialize mutated_ids before any mutation processing
         mutated_ids = []
+
+        # Phase 26B: Apply scout entropy governance to mutation variants
+        # (placed AFTER deterministic variants are generated)
+        entropy_val = 0.5
+        try:
+            total_candidates = max(1, len(candidates)) if 'candidates' in dir() else 5
+            # Use a proxy: more candidates = more uncertainty = higher entropy
+            entropy_val = float(total_candidates) / 20.0
+            total_available = max(0, used_max_variants - len(deterministic_variants))
+            if total_available > 0 and entropy_val > 0.6:
+                extra_variants = self._generate_scout_entropy_variants(
+                    params, entropy_val, total_available
+                )
+                deterministic_variants.extend(extra_variants)
+                logger.info(
+                    f"{self.name}: Phase 26B added {len(extra_variants)} "
+                    f"entropy-governed mutation variants (entropy={entropy_val:.2f})"
+                )
+
+            # Log scout influence on mutation selection
+            await self.db_client.log_scout_influence(
+                source_scout="regime_scout",
+                target_agent=self.name,
+                influence_type="mutation_entropy_governance",
+                influence_metric="entropy_context",
+                after_value=entropy_val,
+                delta=entropy_val - 0.5,
+                confidence=0.6,
+                regime_context=scout_regime_vol or "neutral",
+            )
+        except Exception as e:
+            logger.debug(f"{self.name}: Phase 26B entropy governance skipped: {e}")
 
         for variant in deterministic_variants:
             mut_type = variant.pop("_mutation_type", "deterministic")
@@ -751,7 +787,24 @@ class MutatorAgent(BaseAgent):
                 f"complexity {parent_complexity}->{child_complexity}, "
                 f"predicted_entry_delta {predicted_delta:+d}, "
                 f"cost_eff_delta={cost_eff_delta:+.6f}"
-            )
+            )            # Phase 26E: Log economic attribution for scout-influenced mutation
+            # Note: survived_validation=False because validation hasn't run yet
+            try:
+                await self.db_client.log_economic_attribution(
+                    source_scout="regime_scout",
+                    influence_type="mutation_selection",
+                    target_agent=self.name,
+                    strategy_id=child_id,
+                    strategy_name=child_spec.get('name', ''),
+                    attribution_weight=0.5,
+                    survived_validation=False,
+                    regime_at_time=scout_regime_vol or "neutral",
+                    entropy_at_time=entropy_val,
+                    before_value=0.0,
+                    metadata={"mutation_type": qualified_type, "mut_family": mut_family.value if hasattr(mut_family, 'value') else str(mut_family)},
+                )
+            except Exception:
+                pass
 
         # Publish signals for new strategies
         messaging = MessagingClient(self._redis)
@@ -904,6 +957,53 @@ Mutate conservatively. Output valid JSON: strategy_name, entry_conditions, exit_
                 if isinstance(val, dict):
                     specs.append(val)
             return specs
+
+
+
+
+    async def _generate_scout_entropy_variants(
+        self, params: dict, entropy: float, max_variants: int
+    ) -> list[dict]:
+        """Phase 26B: Generate entropy-governed mutation variants.
+        
+        High entropy (>0.6): Add more exploratory variants
+        Low entropy (<0.3): The deterministic path already handles this conservatively
+        
+        These variants supplement the deterministic micro-mutations with
+        regime-conditioned alternatives.
+        """
+        import random
+        from copy import deepcopy
+        variants = []
+        
+        if max_variants <= 0 or entropy <= 0.6:
+            return variants
+        
+        entry_conds = params.get("entry_conditions", []) or []
+        exit_conds = params.get("exit_conditions", []) or []
+        
+        # High entropy: add regime-conscious alternative entry conditions
+        if entropy > 0.7 and len(entry_conds) >= 2:
+            # Try replacing the most restrictive condition with a regime-adaptive one
+            for cond in entry_conds:
+                if "bollinger_band_position" in cond.lower() and entropy > 0.7:
+                    v = deepcopy(params)
+                    # Replace bollinger with regime-aware condition
+                    new_entry = []
+                    for c in entry_conds:
+                        if "bollinger_band_position" in c.lower() and random.random() < 0.5:
+                            new_entry.append("volatility_regime > 1.3")
+                        else:
+                            new_entry.append(c)
+                    v["entry_conditions"] = new_entry
+                    v["_mutation_type"] = "entropy_exploration"
+                    v["_mutation_fields"] = ["entry_conditions"]
+                    variants.append(v)
+                    break
+        
+        return variants[:max_variants]
+
+
 
 
 async def main():

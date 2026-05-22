@@ -125,8 +125,9 @@ class CopyTraderAgent(BaseAgent):
                 await self.messaging.subscribe(Channel.EXECUTION_FILLS, _callback)
             except Exception as e:
                 logger.warning(f"PubSub subscribe failed, but polling is active: {e}")
-                # Keep running with polling
-                await asyncio.Event().wait()
+                # Keep running with polling — check status periodically for clean shutdown
+                while self.status == "running":
+                    await asyncio.sleep(1)
         finally:
             await self._shutdown_background_tasks()
 
@@ -393,7 +394,7 @@ class CopyTraderAgent(BaseAgent):
                         :id, :trace_id, 'execution_mirrored', :leader_id, :follower_id,
                         :leader_order_id, :follower_order_id, :symbol, :side,
                         :leader_qty, :follower_qty, :leader_price, :follower_price,
-                        :latency_ms, :event_data::jsonb, NOW()
+                        :latency_ms, CAST(:event_data AS jsonb), NOW()
                     )
                     """
                 )
@@ -417,8 +418,8 @@ class CopyTraderAgent(BaseAgent):
         # Publish a small event for observability
         try:
             await self.messaging.publish(Channel.SYSTEM_EVENTS, {"event": "copy_execution", "leader_order_id": leader_order_id, "follower_id": follower_id, "status": status})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to publish copy execution event: {e}")
 
 
 async def main():

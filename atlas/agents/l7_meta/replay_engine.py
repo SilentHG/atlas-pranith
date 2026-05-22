@@ -88,7 +88,7 @@ class ReplayEngine(BaseAgent):
                  integrity_score, n_violations, details)
             VALUES
                 (:id, NOW(), :n_aggregates, :n_events,
-                 :integrity_score, :violations, :details::jsonb)
+                 :integrity_score, :violations, CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

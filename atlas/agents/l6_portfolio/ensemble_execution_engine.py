@@ -350,7 +350,7 @@ class EnsembleExecutionEngine(BaseAgent):
                      consensus_trades, strategy_weights_used, regime_context,
                      metadata)
                 VALUES
-                    (:id, :executed_at::timestamptz, :n_signals_processed,
+                    (:id, :executed_at, :n_signals_processed,
                      :n_trades_generated, :consensus_trades,
                      :strategy_weights_used, :regime_context, :metadata)
                 """,

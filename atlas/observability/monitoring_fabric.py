@@ -106,7 +106,7 @@ class MonitoringFabric:
                 INSERT INTO monitoring_metrics
                     (id, recorded_at, counters, latencies)
                 VALUES
-                    (:id, :recorded_at, :counters::jsonb, :latencies::jsonb)
+                    (:id, :recorded_at, CAST(:counters AS jsonb), CAST(:latencies AS jsonb))
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

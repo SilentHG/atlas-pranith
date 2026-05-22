@@ -92,7 +92,7 @@ class EventStore:
         """Append an immutable event. Returns event_id."""
         async with self._lock:
             event_id = uuid.uuid4().hex[:16]
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc)
 
             # Get previous hash for aggregate stream
             prev_hash = None
@@ -104,6 +104,9 @@ class EventStore:
                     next_sequence = last_event.sequence + 1
 
             # Build content for self-hash
+            # IMPORTANT: Use isoformat() for JSON serialization — datetime objects
+            # are NOT JSON-serializable by default.
+            now_iso = now.isoformat()
             content = {
                 "id": event_id,
                 "event_type": event_type,
@@ -116,10 +119,10 @@ class EventStore:
                 "metadata": metadata or {},
                 "hash_prev": prev_hash,
                 "sequence": next_sequence,
-                "created_at": now,
+                "created_at": now_iso,
             }
             hash_self = hashlib.sha256(
-                json.dumps(content, sort_keys=True).encode("utf-8")
+                json.dumps(content, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()
 
             await self.db._execute_insert(
@@ -130,8 +133,8 @@ class EventStore:
                      hash_prev, hash_self, created_at, sequence)
                 VALUES
                     (:id, :event_type, :version, :trace_id, :parent_event_id,
-                     :aggregate_id, :aggregate_type, :data::jsonb, :metadata::jsonb,
-                     :hash_prev, :hash_self, :created_at::timestamptz, :sequence)
+                     :aggregate_id, :aggregate_type, CAST(:data AS jsonb), CAST(:metadata AS jsonb),
+                     :hash_prev, :hash_self, :created_at, :sequence)
                 """,
                 {
                     "id": event_id,
@@ -283,7 +286,7 @@ class EventStore:
             INSERT INTO event_snapshots
                 (id, aggregate_id, state, version, created_at)
             VALUES
-                (:id, :aggregate_id, :state::jsonb, :version, NOW())
+                (:id, :aggregate_id, CAST(:state AS jsonb), :version, NOW())
             """,
             {
                 "id": snapshot_id,
@@ -388,7 +391,7 @@ class EventStore:
                 "created_at": event.created_at,
             }
             expected_hash = hashlib.sha256(
-                json.dumps(content, sort_keys=True).encode("utf-8")
+                json.dumps(content, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()
 
             if expected_hash != event.hash_self:

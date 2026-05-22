@@ -406,6 +406,13 @@ class IdeatorAgentV2(BaseAgent):
         self._failure_warned: bool = False
         self._context_enabled: bool = True
 
+
+        # Phase 26: Scout coupling state
+        self._scout_archetype_weights: dict[str, float] | None = None
+        self._scout_aggression_factor: float = 1.0
+        self._scout_confidence_modulator: float = 1.0
+        self._scout_liquidity_sensitivity: float = 1.0
+
         # Diversity governance — reject strategies with >70% feature overlap
         # 55-70% zone: soft penalty (feature variety encouraged but not rigidly enforced)
         self.DIVERSITY_SIMILARITY_THRESHOLD = 0.70
@@ -476,6 +483,27 @@ class IdeatorAgentV2(BaseAgent):
                     strategy_signature=sig,
                     generation_batch=batch,
                 )
+
+                # Phase 26E: Log economic attribution for scout-influenced strategy
+                try:
+                    cached_ctx = getattr(self, '_ctx_cache', {})
+                    scout_weights = cached_ctx.get("scout_archetype_weights")
+                    if scout_weights:
+                        scout_max_key = max(scout_weights, key=scout_weights.get)
+                        await self.db_client.log_economic_attribution(
+                            source_scout=f"ideator_archetype_{scout_max_key}",
+                            influence_type="archetype_selection",
+                            target_agent=self.name,
+                            strategy_id=strategy_id,
+                            strategy_name=spec.get('strategy_name', ''),
+                            attribution_weight=max(scout_weights.values()),
+                            survived_validation=False,  # Validation hasn't run yet
+                            regime_at_time=cached_ctx.get('regime', ''),
+                            entropy_at_time=self._scout_confidence_modulator,
+                            before_value=1.0 / max(1, len(ARCHETYPES)),
+                        )
+                except Exception:
+                    pass
 
                 logger.info(
                     f"{self.name}: ✅ {spec['strategy_name']} "
@@ -792,6 +820,29 @@ class IdeatorAgentV2(BaseAgent):
         except Exception as e:
             ctx["scout_intelligence"] = f"Scout fetch failed: {e}"
 
+        # SCOUT SIGNALS ENRICHMENT (Phase 25D) - only if main fetch succeeded
+        if not ctx.get("scout_intelligence", "").startswith("Scout fetch failed"):
+            try:
+                ss = await self.db_client.get_scout_signal_summary()
+                if ss and ss.get("total_signals", 0) > 0:
+                    enriched_lines = []
+                    for (src, sig_type), info in ss.get("by_source", {}).items():
+                        enriched_lines.append(
+                            f"  {src}: {info['count']} signals "
+                            f"(type={sig_type}, "
+                            f"avg_conf={info['avg_confidence']})"
+                        )
+                    for sig in ss.get("recent", []):
+                        sym = sig.get("symbol") or "market"
+                        enriched_lines.append(
+                            f"  -> {sig['source']} flagged {sym} "
+                            f"({sig['type']}, conf={sig['confidence']})"
+                        )
+                    existing = ctx.get("scout_intelligence", "")
+                    ctx["scout_intelligence"] = existing + "\n\n" + "\n".join(enriched_lines)
+            except Exception as e:
+                logger.debug(f"{self.name}: Scout signals enrichment skipped: {e}")
+
         # ─────────────────────────────────────────────────────────
         # COST INTELLIGENCE CONTEXT (NEW)
         # ─────────────────────────────────────────────────────────
@@ -839,11 +890,169 @@ class IdeatorAgentV2(BaseAgent):
             ctx["cost_intelligence"] = "Cost Intelligence DISABLED via env"
             ctx["cost_metrics"] = ""
 
+
+        # Phase 26A: Scout-aware archetype weighting and modulation
+        try:
+            regime_for_mod = ctx.get("regime", "neutral")
+            scout_text = ctx.get("scout_intelligence", "")
+            archetype_weights = self._compute_scout_archetype_weights(
+                regime_for_mod, scout_text
+            )
+            ctx["scout_archetype_weights"] = archetype_weights
+            ctx["scout_aggression_factor"] = self._compute_scout_aggression(
+                regime_for_mod, scout_text
+            )
+            ctx["scout_timeframe_preference"] = self._compute_scout_timeframe(
+                scout_text
+            )
+
+            # Log scout influence events
+            import uuid
+            if archetype_weights:
+                dominant_archetype = max(archetype_weights, key=archetype_weights.get)
+                await self.db_client.log_scout_influence(
+                    source_scout="regime_scout",
+                    target_agent=self.name,
+                    influence_type="archetype_weighting",
+                    influence_metric=dominant_archetype,
+                    delta=archetype_weights.get(dominant_archetype, 0) - (1.0 / max(1, len(ARCHETYPES))),
+                    confidence=0.6,
+                    regime_context=regime_for_mod,
+                    entropy_context=self._scout_confidence_modulator,
+                    metadata={"all_weights": archetype_weights},
+                )
+
+            # Log aggression modulation
+            if ctx["scout_aggression_factor"] != 1.0:
+                await self.db_client.log_scout_influence(
+                    source_scout="liquidity_scout",
+                    target_agent=self.name,
+                    influence_type="aggression_modulation",
+                    influence_metric="aggression_factor",
+                    before_value=1.0,
+                    after_value=ctx["scout_aggression_factor"],
+                    delta=ctx["scout_aggression_factor"] - 1.0,
+                    confidence=0.5,
+                    regime_context=regime_for_mod,
+                )
+        except Exception as e:
+            logger.debug(f"{self.name}: Scout modulation failed: {e}")
+            ctx["scout_archetype_weights"] = None
+            ctx["scout_aggression_factor"] = 1.0
+            ctx["scout_timeframe_preference"] = "1m"
+
+
         return ctx
 
     # ─────────────────────────────────────────────────────────
     # DIVERSITY GOVERNANCE
     # ─────────────────────────────────────────────────────────
+
+    # ================================================================
+    # PHASE 26A — SCOUT-AWARE ARCHETYPE AND AGGRESSION MODULATION
+    # ================================================================
+
+    def _compute_scout_archetype_weights(
+        self, regime: str, scout_text: str
+    ) -> dict[str, float]:
+        """Compute scout-informed archetype weights based on regime and market conditions.
+        
+        Returns {archetype: weight} dict that can bias archetype selection.
+        Higher weight = more likely to be selected.
+        """
+        base_weight = 1.0 / len(ARCHETYPES)
+        weights = {a: base_weight for a in ARCHETYPES}
+
+        # Regime-based modulation
+        regime_lower = regime.lower()
+        if "oversold" in regime_lower or "bearish" in regime_lower:
+            weights["mean_reversion"] *= 1.8
+            weights["momentum"] *= 0.6
+            weights["breakout"] *= 0.4
+            weights["trend_following"] *= 0.7
+            weights["volatility_regime"] *= 1.3
+        elif "overbought" in regime_lower or "bullish" in regime_lower:
+            weights["momentum"] *= 1.6
+            weights["trend_following"] *= 1.5
+            weights["breakout"] *= 1.4
+            weights["mean_reversion"] *= 0.5
+        elif "high_vol" in regime_lower or "panic_vol" in regime_lower:
+            weights["volatility_regime"] *= 2.0
+            weights["breakout"] *= 1.3
+            weights["mean_reversion"] *= 1.5
+            weights["momentum"] *= 0.5
+            weights["trend_following"] *= 0.6
+        elif "ranging" in regime_lower or "neutral" in regime_lower:
+            weights["mean_reversion"] *= 1.6
+            weights["volatility_regime"] *= 1.2
+            weights["momentum"] *= 0.8
+            weights["breakout"] *= 0.7
+            weights["trend_following"] *= 0.9
+
+        # Scout text parsing for additional signals
+        scout_lower = scout_text.lower()
+        if "liquidity" in scout_lower and ("thin" in scout_lower or "stressed" in scout_lower):
+            # Low liquidity: prefer lower-frequency archetypes
+            weights["breakout"] *= 0.5
+            weights["momentum"] *= 0.7
+            weights["mean_reversion"] *= 1.3
+        if "volatility" in scout_lower:
+            if "high" in scout_lower or "panic" in scout_lower:
+                weights["volatility_regime"] *= 1.5
+            elif "low" in scout_lower:
+                weights["volatility_regime"] *= 0.6
+        if "correlation" in scout_lower and "spike" in scout_lower:
+            # Correlation spikes: reduce regime-dependent strategies
+            weights["volatility_regime"] *= 1.4
+            weights["momentum"] *= 0.8
+
+        # Normalize to sum to 1.0
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def _compute_scout_aggression(self, regime: str, scout_text: str) -> float:
+        """Compute aggression factor from scout conditions.
+        1.0 = standard aggression.
+        < 1.0 = more conservative (wider stops, lower leverage).
+        > 1.0 = more aggressive (tighter stops, normal leverage).
+        """
+        factor = 1.0
+        regime_lower = regime.lower()
+
+        # High volatility -> lower aggression
+        if "high_vol" in regime_lower or "panic_vol" in regime_lower:
+            factor *= 0.6
+        # Trending -> normal to slightly higher aggression
+        elif "trending" in regime_lower:
+            factor *= 1.1
+        # Oversold -> moderate aggression (mean reversion)
+        elif "oversold" in regime_lower:
+            factor *= 0.9
+
+        scout_lower = scout_text.lower()
+        if "thin" in scout_lower or "stressed" in scout_lower:
+            factor *= 0.5
+        if "degraded" in scout_lower or "unstable" in scout_lower:
+            factor *= 0.4
+        if "spike" in scout_lower:
+            factor *= 0.7
+
+        return max(0.2, min(2.0, factor))
+
+    def _compute_scout_timeframe(self, scout_text: str) -> str:
+        """Select preferred timeframe based on scout conditions."""
+        scout_lower = scout_text.lower()
+        if "thin" in scout_lower or "stressed" in scout_lower:
+            return "5m"  # Lower frequency when liquidity is poor
+        if "degraded" in scout_lower:
+            return "5m"
+        if "panic" in scout_lower:
+            return "15m"  # Very conservative in panic
+        return "1m"  # Default
+
+
     def _check_diversity(
         self,
         spec: dict,
@@ -1126,8 +1335,34 @@ class IdeatorAgentV2(BaseAgent):
 
         grammar = STRATEGY_GRAMMAR.get(archetype)
         if not grammar:
-            # Unknown archetype — fall back to template
             return None, None, None
+        # Phase 26A: Scout-aware archetype modulation
+        scout_weights = ctx.get("scout_archetype_weights")
+        if scout_weights:
+            import random
+            # Weighted random choice based on scout conditions
+            arch_keys = list(scout_weights.keys())
+            arch_weights = [scout_weights[k] for k in arch_keys]
+            total_weight = sum(arch_weights)
+            if total_weight <= 0:
+                arch_weights = [1.0 / len(arch_keys)] * len(arch_keys)
+            modulated_archetype = random.choices(arch_keys, weights=arch_weights, k=1)[0]
+            if modulated_archetype != archetype:
+                logger.info(
+                    f"{self.name}: Scout modulated archetype "
+                    f"{archetype} -> {modulated_archetype} "
+                    f"(weights={scout_weights})"
+                )
+            archetype = modulated_archetype
+            grammar = STRATEGY_GRAMMAR.get(archetype)
+            if not grammar:
+                archetype = ctx["archetype"]
+                grammar = STRATEGY_GRAMMAR.get(archetype)
+
+        # Scout aggression and timeframe modulation
+        aggression = ctx.get("scout_aggression_factor", 1.0)
+        timeframe = ctx.get("scout_timeframe_preference", "1m")
+
 
         # Select entry conditions from grammar templates
         entry_pool = list(grammar["entry_templates"])

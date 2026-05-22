@@ -147,7 +147,7 @@ class FeatureEvolutionEngine(BaseAgent):
         parent_id: Optional[str] = None,
     ):
         """Register a new evolved feature."""
-        feature_id = uuid.uuid4().hex[:16]
+        feature_id = uuid.uuid4()
         await self.db._execute_insert(
             """
             INSERT INTO feature_importance
@@ -155,7 +155,8 @@ class FeatureEvolutionEngine(BaseAgent):
                  n_uses, survival_rate, dominant_archetype, metadata)
             VALUES
                 (:id, :name, 0.5, 1, 0.5, '',
-                 :metadata::jsonb)
+                 CAST(:metadata AS jsonb))
+            ON CONFLICT (feature_name) DO NOTHING
             """,
             {
                 "id": feature_id,
@@ -171,12 +172,16 @@ class FeatureEvolutionEngine(BaseAgent):
 
     async def _retire_feature(self, feature_id: str):
         """Retire a low-importance feature."""
-        await self.db._execute_insert(
-            """
-            UPDATE feature_importance
-            SET feature_name = CONCAT('retired_', feature_name),
-                metadata = COALESCE(metadata, '{}'::jsonb) || '{"retired_at": $1}'::jsonb
-            WHERE id = :id
-            """,
-            {"id": feature_id},
-        )
+        async with self.db.engine.connect() as conn:
+            await conn.execute(
+                text("""
+                    UPDATE feature_importance
+                    SET feature_name = CONCAT('retired_', feature_name),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || CAST(:retired_at AS jsonb)
+                    WHERE id = CAST(:id AS uuid)
+                """),
+                {
+                    "id": feature_id,
+                    "retired_at": json.dumps({"retired_at": datetime.now(timezone.utc).isoformat()}),
+                },
+            )

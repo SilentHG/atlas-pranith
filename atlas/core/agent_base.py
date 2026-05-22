@@ -50,6 +50,15 @@ class BaseAgent(ABC):
         self._retry_count: int = 0
         self.MAX_RETRIES: int = 3
 
+        # Minimum wall-clock duration for a single run() cycle.
+        # If the agent's run() completes faster than this, _run_with_retry
+        # will add a cooldown before exiting the task, preventing tight
+        # restart loops in the supervisor.
+        self._min_run_duration: float = 60.0  # seconds
+        # Minimum interval between successive starts to avoid restart storms
+        self._min_restart_interval: float = 30.0  # seconds
+        self._last_start_time: float | None = None
+
         self._heartbeat_task: asyncio.Task | None = None
         self._main_task: asyncio.Task | None = None
 
@@ -70,10 +79,22 @@ class BaseAgent(ABC):
         if self.status == AgentStatus.RUNNING.value:
             return
 
+        # Enforce a minimum restart interval to prevent supervisor restart storms
+        now = asyncio.get_event_loop().time()
+        if self._last_start_time is not None:
+            elapsed = now - self._last_start_time
+            if elapsed < self._min_restart_interval:
+                wait = self._min_restart_interval - elapsed
+                logger.info(
+                    f"Agent {self.name}: delaying start {wait:.0f}s to enforce min_restart_interval"
+                )
+                await asyncio.sleep(wait)
+
         self.status = AgentStatus.RUNNING.value
 
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._main_task = asyncio.create_task(self._run_with_retry())
+        self._last_start_time = asyncio.get_event_loop().time()
 
         logger.info(f"Agent {self.name} started.")
 
@@ -142,7 +163,25 @@ class BaseAgent(ABC):
             and self.status == AgentStatus.RUNNING.value
         ):
             try:
+                run_start = asyncio.get_event_loop().time()
                 await self.run()
+                run_elapsed = asyncio.get_event_loop().time() - run_start
+
+                # Guard against tight restart loops: if the agent's run()
+                # completed faster than _min_run_duration, pad with a sleep
+                # so the task doesn't exit prematurely.
+                if run_elapsed < self._min_run_duration:
+                    pad = self._min_run_duration - run_elapsed
+                    logger.info(
+                        f"Agent {self.name} completed in {run_elapsed:.1f}s "
+                        f"(< min {self._min_run_duration:.0f}s) — "
+                        f"cooldown {pad:.0f}s before task exit"
+                    )
+                    await asyncio.sleep(pad)
+
+                # Successful completion — mark agent as stopped (healthy idle)
+                self.status = AgentStatus.STOPPED.value
+                logger.info(f"Agent {self.name} completed run() successfully — entering stopped state")
                 break
 
             except asyncio.CancelledError:
@@ -166,7 +205,9 @@ class BaseAgent(ABC):
                         f"Agent {self.name} exceeded max retries."
                     )
 
-                    await self.stop()
+                    # DO NOT call self.stop() here — that cancels the task
+                    # we're running in, causing RecursionError during shutdown.
+                    # The parent supervisor loop handles stopping dead agents.
                     break
 
     @abstractmethod

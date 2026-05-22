@@ -286,7 +286,7 @@ class ExecutionRealismEngine(BaseAgent):
                      execution_degradation_score, liquidity_state,
                      simulated_fills, metadata)
                 VALUES
-                    (:id, :simulated_at::timestamptz, :n_trades_simulated,
+                    (:id, :simulated_at, :n_trades_simulated,
                      :avg_fill_probability, :avg_expected_slippage_bps,
                      :avg_expected_partial_pct, :avg_simulated_latency_ms,
                      :avg_market_impact_bps, :exhaustion_scenario,

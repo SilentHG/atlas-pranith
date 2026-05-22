@@ -63,6 +63,7 @@ from atlas.agents.scouts.hypothesis_validation_engine import HypothesisValidatio
 from atlas.config.settings import get_settings
 from atlas.core.event_lineage import EventLineageClient
 from atlas.data.storage.timescale_client import TimescaleClient
+from atlas.scripts.soak.phase24_monitor import SoakMonitor
 
 
 def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
@@ -156,6 +157,15 @@ async def main() -> None:
 
     agents = _build_agents(redis_client, db_client)
 
+    # Phase 24: Soak monitoring (non-blocking — failures are logged, not fatal)
+    monitor = SoakMonitor(db_client, redis_client, interval_seconds=300)
+    try:
+        await monitor.start()
+        logger.info("SoakMonitor started — capturing metrics every 300s")
+    except Exception as e:
+        logger.error(f"SoakMonitor failed to start: {e} — continuing without monitoring")
+        monitor = None
+
     logger.info(
         "Starting institutional cycle with Phases 13-18: "
         "portfolio -> risk -> meta-learn -> scout -> execute -> govern -> monitor"
@@ -215,7 +225,6 @@ async def main() -> None:
                                 if agent._main_task and not agent._main_task.done():
                                     tasks[i] = agent._main_task
                                     _reported.discard(i)
-                                    _restart_blocked_until.pop(i, None)
                                     restart_succeeded = True
                                     logger.info(f"Agent restarted successfully — {agent_name}")
                                 else:
@@ -223,11 +232,16 @@ async def main() -> None:
                             except Exception as restart_exc:
                                 logger.error(f"Agent restart raised exception — {agent_name}: {restart_exc}")
                             finally:
-                                if not restart_succeeded:
-                                    # Exponential backoff: 10s, 20s, 40s, 80s... capped at 600s
-                                    _restart_counts[i] = _restart_counts.get(i, 0) + 1
-                                    _restart_blocked_until[i] = now + min(
-                                        10 * (2 ** (_restart_counts[i] - 1)), 600
+                                # ALWAYS apply exponential backoff after any restart attempt
+                                # (success or failure) to prevent tight loops from fast-exiting agents.
+                                _restart_counts[i] = _restart_counts.get(i, 0) + 1
+                                _restart_blocked_until[i] = now + min(
+                                    60 * (2 ** min(_restart_counts[i] - 1, 4)), 600
+                                )
+                                if restart_succeeded:
+                                    logger.info(
+                                        f"Restart cooldown {min(60 * (2 ** min(_restart_counts[i] - 1, 4)), 600)}s "
+                                        f"for {agent_name}"
                                     )
 
                     if not restart_succeeded:
@@ -235,6 +249,8 @@ async def main() -> None:
 
             await asyncio.sleep(5)
     finally:
+        if monitor:
+            await monitor.stop()
         await _stop_agents(agents)
         try:
             await redis_client.aclose()

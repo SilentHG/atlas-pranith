@@ -74,42 +74,61 @@ class SystemHealthEngine(BaseAgent):
         import asyncio
         await asyncio.sleep(seconds)
 
+    async def _safe_count(self, conn, query: str, params: dict | None = None, default: int = 0) -> int:
+        """Execute a COUNT query safely — returns default on table-not-found errors."""
+        try:
+            r = await conn.execute(text(query), params or {})
+            return r.scalar() or default
+        except Exception as e:
+            logger.debug(f"Health query failed (table may not exist): {e}")
+            return default
+
+    async def _safe_scalar(self, conn, query: str, default: float = 0.0) -> float:
+        """Execute a scalar query safely — returns default on errors."""
+        try:
+            r = await conn.execute(text(query))
+            return float(r.scalar() or default)
+        except Exception as e:
+            logger.debug(f"Health scalar failed (table may not exist): {e}")
+            return default
+
     async def _compute_system_health(self) -> dict:
         """Compute health scores for all subsystems."""
+        scores = {}
+        degraded = []
+
         async with self.db.engine.connect() as conn:
-            scores = {}
-            degraded = []
+            # Each subsystem query is wrapped with _safe_count / _safe_scalar
+            # so non-existent tables or schema drift don't crash the health engine.
 
             # Ingestion health — check recent data freshness
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM market_data_l1 WHERE timestamp > NOW() - INTERVAL '1 hour'")
+            recent_bars = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM market_data_l1 WHERE time > NOW() - INTERVAL '1 hour'"
             )
-            recent_bars = r.scalar() or 0
             scores["ingestion"] = min(100.0, (recent_bars / 100) * 100) if recent_bars > 0 else 0.0
             if scores["ingestion"] < 30:
                 degraded.append("ingestion")
 
             # Ideation health — recent strategies generated
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM strategies WHERE created_at > NOW() - INTERVAL '1 hour'")
+            recent_strategies = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM strategies WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            recent_strategies = r.scalar() or 0
             scores["ideation"] = min(100.0, recent_strategies * 20)
             if scores["ideation"] < 20:
                 degraded.append("ideation")
 
             # Backtest health — recent backtests
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM backtest_results WHERE created_at > NOW() - INTERVAL '1 hour'")
+            recent_backtests = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM backtest_results WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            recent_backtests = r.scalar() or 0
             scores["backtest"] = min(100.0, recent_backtests * 10)
             if scores["backtest"] < 10:
                 degraded.append("backtest")
 
             # Validation health — recent validations
-            r = await conn.execute(
-                text("""
+            recent_validations = await self._safe_count(
+                conn,
+                """
                     SELECT COUNT(*) FROM (
                         SELECT analyzed_at FROM walk_forward_analysis
                         WHERE analyzed_at > NOW() - INTERVAL '1 hour'
@@ -117,77 +136,72 @@ class SystemHealthEngine(BaseAgent):
                         SELECT simulated_at FROM monte_carlo_analysis
                         WHERE simulated_at > NOW() - INTERVAL '1 hour'
                     ) v
-                """)
+                """,
             )
-            recent_validations = r.scalar() or 0
             scores["validation"] = min(100.0, recent_validations * 25)
             if scores["validation"] < 25:
                 degraded.append("validation")
 
             # Portfolio health — recent portfolio intel
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM portfolio_intelligence WHERE computed_at > NOW() - INTERVAL '1 hour'")
+            recent_portfolio = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM portfolio_intelligence WHERE computed_at > NOW() - INTERVAL '1 hour'"
             )
-            recent_portfolio = r.scalar() or 0
             scores["portfolio"] = min(100.0, recent_portfolio * 50)
             if scores["portfolio"] < 50:
                 degraded.append("portfolio")
 
             # Execution health — recent trades
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM execution_log WHERE created_at > NOW() - INTERVAL '1 hour'")
+            recent_trades = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM execution_log WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            recent_trades = r.scalar() or 0
             scores["execution"] = min(100.0, recent_trades * 10)
             if scores["execution"] < 10:
                 degraded.append("execution")
 
             # Scout health — recent scout signals
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM external_scout_memory WHERE timestamp > NOW() - INTERVAL '1 hour'")
+            recent_scouts = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM external_scout_memory WHERE timestamp > NOW() - INTERVAL '1 hour'"
             )
-            recent_scouts = r.scalar() or 0
             scores["scouts"] = min(100.0, recent_scouts * 10)
             if scores["scouts"] < 10:
                 degraded.append("scouts")
 
             # Drift health — drift severity check
-            r = await conn.execute(
-                text("""
+            drift_severity = await self._safe_scalar(
+                conn,
+                """
                     SELECT COALESCE(composite_severity, 0)
                     FROM drift_detection
                     ORDER BY detected_at DESC LIMIT 1
-                """)
+                """,
             )
-            drift_severity = float(r.scalar() or 0)
             scores["drift"] = max(0.0, 100.0 - drift_severity * 100)
             if drift_severity > 0.7:
                 degraded.append("drift")
 
             # Replay health
-            r = await conn.execute(
-                text("""
+            replay_score = await self._safe_scalar(
+                conn,
+                """
                     SELECT COALESCE(integrity_score, 0)
                     FROM replay_integrity
                     ORDER BY checked_at DESC LIMIT 1
-                """)
+                """,
+                default=100.0,
             )
-            replay_score = float(r.scalar() or 100)
             scores["replay"] = replay_score
             if replay_score < 80:
                 degraded.append("replay")
 
             # Audit health
-            r = await conn.execute(
-                text("SELECT COUNT(*) FROM audit_ledger WHERE created_at > NOW() - INTERVAL '1 hour'")
+            audit_entries = await self._safe_count(
+                conn, "SELECT COUNT(*) FROM audit_ledger WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            audit_entries = r.scalar() or 0
             scores["audit"] = min(100.0, audit_entries * 10)
             if audit_entries == 0:
                 degraded.append("audit")
 
             # Dashboard health
-            r = await conn.execute(text("SELECT 1"))
             scores["dashboard"] = 100.0
 
             # API health
@@ -234,7 +248,7 @@ class SystemHealthEngine(BaseAgent):
                  n_degraded, n_total)
             VALUES
                 (:id, NOW(), :composite_score, :system_mode,
-                 :subsystem_scores::jsonb, :degraded_subsystems::jsonb,
+                 CAST(:subsystem_scores AS jsonb), CAST(:degraded_subsystems AS jsonb),
                  :n_degraded, :n_total)
             """,
             {

@@ -85,7 +85,7 @@ class DeploymentGovernor(BaseAgent):
                  proposed_at, metadata)
             VALUES
                 (:id, :strategy_id, :mode, 'pending_approval',
-                 :proposed_by, NOW(), :metadata::jsonb)
+                 :proposed_by, NOW(), CAST(:metadata AS jsonb))
             """,
             {
                 "id": dep_id,

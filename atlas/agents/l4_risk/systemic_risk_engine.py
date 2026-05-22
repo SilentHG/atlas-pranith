@@ -84,7 +84,7 @@ class SystemicRiskEngine(BaseAgent):
             VALUES
                 (:id, NOW(), :sys_risk, :contagion_prob,
                  :fragility, :corr_regime, :concentration,
-                 :n_strategies, :details::jsonb)
+                 :n_strategies, CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],
@@ -113,7 +113,7 @@ class SystemicRiskEngine(BaseAgent):
             r = await conn.execute(
                 text("""
                     SELECT p.strategy_id, p.symbol, p.qty, p.side,
-                           COALESCE(c.correlation_value, 0) as correlation
+                           COALESCE(c.avg_pairwise_corr, 0) as correlation
                     FROM positions p
                     LEFT JOIN correlation_memory c ON c.id = (
                         SELECT id FROM correlation_memory

@@ -116,7 +116,7 @@ class LeaderGovernanceEngine(BaseAgent):
             VALUES
                 (:id, :trace_id, :leader_id, :health, :state,
                  :dd, :surv, :exec_q, :replay, :drift, :conc, :slip, :mort,
-                 :vol_adj, :n_foll, :meta::jsonb, NOW())
+                 :vol_adj, :n_foll, CAST(:meta AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],

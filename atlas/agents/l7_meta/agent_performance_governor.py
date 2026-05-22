@@ -81,7 +81,7 @@ class AgentPerformanceGovernor(BaseAgent):
                  agent_scores, throttled_agents)
             VALUES
                 (:id, NOW(), :n_agents,
-                 :scores::jsonb, :throttled::jsonb)
+                 CAST(:scores AS jsonb), CAST(:throttled AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

@@ -435,11 +435,11 @@ Output JSON:
                      n_failures_analyzed, advisory_only, metadata, created_at)
                 VALUES
                     (:id, :trace_id, :analysis_type, :confidence,
-                     :root_causes::jsonb, :systemic_patterns::jsonb,
-                     :governance_recommendations::jsonb,
-                     :mutation_collapse_warnings::jsonb,
-                     :feature_saturation_alerts::jsonb,
-                     :n_failures, TRUE, :metadata::jsonb, NOW())
+                     CAST(:root_causes AS jsonb), CAST(:systemic_patterns AS jsonb),
+                     CAST(:governance_recommendations AS jsonb),
+                     CAST(:mutation_collapse_warnings AS jsonb),
+                     CAST(:feature_saturation_alerts AS jsonb),
+                     :n_failures, TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

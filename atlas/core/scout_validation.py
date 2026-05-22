@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from atlas.core.serialization import normalize_json_value
+from atlas.core.serialization import normalize_json_value, normalize_timestamp
 
 
 @dataclass
@@ -30,14 +30,14 @@ def validate_scout_payload(payload: dict[str, Any]) -> ScoutValidationResult:
     if not source:
         reasons.append("missing_source")
 
-    timestamp = normalized.get("timestamp")
-    if timestamp is None:
-        normalized["timestamp"] = datetime.now(timezone.utc).isoformat()
-    else:
-        if isinstance(timestamp, datetime):
-            normalized["timestamp"] = timestamp.isoformat()
-        elif not isinstance(timestamp, str):
-            reasons.append("invalid_timestamp")
+    # Phase 24: Use centralized normalize_timestamp() for timestamp handling
+    raw_ts = payload.get("timestamp")  # raw original (pre-normalize_json_value)
+    try:
+        # Keep timestamp as a timezone-aware datetime object for deterministic DB binding
+        normalized["timestamp"] = normalize_timestamp(raw_ts)
+    except Exception as e:
+        reasons.append(f"invalid_timestamp: {e}")
+        normalized["timestamp"] = datetime.now(timezone.utc)
 
     confidence = normalized.get("confidence")
     if confidence is None:

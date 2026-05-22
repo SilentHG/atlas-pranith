@@ -145,7 +145,7 @@ class AntiPoisoningEngine(BaseAgent):
                  severity_score, affected_symbols, action_taken, metadata)
             VALUES
                 (:id, :trace_id, :source, :sub, :violation,
-                 :severity, :symbols::jsonb, :action, :metadata::jsonb)
+                 :severity, CAST(:symbols AS jsonb), :action, CAST(:metadata AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

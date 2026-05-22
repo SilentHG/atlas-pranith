@@ -66,6 +66,11 @@ class MutationPolicyEngine(BaseAgent):
                 await self._learn_policy()
 
                 # Phase 19E: Generate advisory reasoning after deterministic learning
+                # Phase 26B: Scout-aware mutation policy adaptation
+                scout = await self._fetch_scout_context_for_policy()
+                if scout:
+                    self._apply_scout_to_weights(scout)
+
                 if self._llm_enabled:
                     await self._generate_mutation_advisory()
             except Exception as e:
@@ -130,8 +135,8 @@ class MutationPolicyEngine(BaseAgent):
                 (id, learned_at, mutation_weights, per_type_success_rates,
                  n_observations, details)
             VALUES
-                (:id, NOW(), :weights::jsonb, :rates::jsonb,
-                 :n_obs, :details::jsonb)
+                (:id, NOW(), CAST(:weights AS jsonb), CAST(:rates AS jsonb),
+                 :n_obs, CAST(:details AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],
@@ -154,7 +159,7 @@ class MutationPolicyEngine(BaseAgent):
         async with self.db.engine.connect() as conn:
             r = await conn.execute(
                 text("""
-                    SELECT m.id, m.mutation_type, m.strategy_id,
+                    SELECT m.id, m.mutation_type, m.id as strategy_id,
                            COALESCE(br.short_window_score, 0) as outcome_score
                     FROM strategies m
                     LEFT JOIN LATERAL (
@@ -178,6 +183,94 @@ class MutationPolicyEngine(BaseAgent):
                 }
                 for row in r.fetchall()
             ]
+
+
+
+    # ================================================================
+    # PHASE 26B — SCOUT-AWARE MUTATION POLICY ADAPTATION
+    # ================================================================
+
+    async def _fetch_scout_context_for_policy(self) -> dict | None:
+        """Fetch scout context for mutation policy adaptation."""
+        try:
+            summary = await self.db.get_scout_influence_summary(hours=24)
+            if summary and len(summary) > 0:
+                regime = {}
+                liquidity = {}
+                execution = {}
+                correlation = {}
+                for row in summary:
+                    ctx = row.get('regime_context', '') or ''
+                    ctx_lower = ctx.lower()
+                    if 'high_vol' in ctx_lower or 'panic' in ctx_lower:
+                        regime['volatility'] = ctx
+                    if 'thin' in ctx_lower or 'dangerous' in ctx_lower:
+                        liquidity['regime'] = ctx
+                    if 'degraded' in ctx_lower or 'stressed' in ctx_lower:
+                        execution['regime'] = ctx
+                return {'regime': regime, 'liquidity': liquidity, 'execution': execution, 'correlation': correlation}
+            return None
+        except Exception:
+            return None
+
+    def _apply_scout_to_weights(self, scout: dict) -> None:
+        """Modify mutation weights based on scout conditions.
+        Modifies self._weights in-memory (does NOT persist to DB).
+        """
+        regime = scout.get("regime", {})
+        liquidity = scout.get("liquidity", {})
+        execution = scout.get("execution", {})
+        correlation = scout.get("correlation", {})
+
+        vol = str(regime.get("volatility", ""))
+        liq_regime = str(liquidity.get("regime", ""))
+        exec_regime = str(execution.get("regime", ""))
+        corr_risk = str(correlation.get("risk_state", ""))
+
+        adjustments = {}
+
+        # Volatility-based adjustments
+        if "high_vol" in vol.lower() or "panic_vol" in vol.lower():
+            adjustments = {
+                "parameter_shift": 0.30,   # More parameter shifts in volatile markets
+                "regime_adapt": 0.20,       # Regime adaptation becomes critical
+                "combine_with": 0.05,       # Suppress combination mutations
+            }
+        elif "low_vol" in vol.lower():
+            adjustments = {
+                "indicator_replace": 0.25,
+                "exit_logic": 0.15,
+                "regime_adapt": 0.05,
+            }
+
+        # Liquidity-based adjustments
+        if liq_regime in ("thin", "dangerous"):
+            adjustments.update({
+                "threshold_loosen": 0.25,   # Loosen thresholds to avoid false signals
+                "threshold_tighten": 0.05,  # Don't tighten further in thin markets
+            })
+
+        # Execution-based adjustments
+        if exec_regime in ("degraded", "stressed"):
+            adjustments.update({
+                "risk_adjust": 0.25,        # More risk adjustments
+                "exit_logic": 0.20,         # Better exits
+            })
+
+        # Apply adjustments if any were computed
+        if adjustments:
+            new_weights = dict(self._weights)
+            for k, v in adjustments.items():
+                new_weights[k] = v
+
+            # Normalize
+            total = sum(new_weights.values())
+            if total > 0:
+                self._weights = {k: v / total for k, v in new_weights.items()}
+                logger.info(
+                    f"{self.name}: Scout-adjusted mutation weights "
+                    f"(vol={vol}, liq={liq_regime}, exec={exec_regime})"
+                )
 
     def select_mutation_type(self) -> str:
         """Select a mutation type based on learned weights. DETERMINISTIC — canonical."""
@@ -310,8 +403,8 @@ Output JSON:
                 VALUES
                     (:id, :trace_id, :confidence, :advisory,
                      :ee_balance, :entropy,
-                     :div_advisory, :weights::jsonb,
-                     :leaderboard::jsonb, TRUE, :metadata::jsonb, NOW())
+                     :div_advisory, CAST(:weights AS jsonb),
+                     CAST(:leaderboard AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

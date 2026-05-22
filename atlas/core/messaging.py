@@ -19,8 +19,8 @@ class MessagingClient:
         try:
             payload = json.dumps(message)
             await self.redis.publish(channel.value, payload)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Messaging publish to {channel.value} failed: {e}")
 
     async def subscribe(self, channel: Channel, callback: callable) -> None:
         pubsub = self.redis.pubsub()
@@ -29,9 +29,8 @@ class MessagingClient:
             if message["type"] == "message":
                 try:
                     data = json.loads(message["data"])
-                    # Mocking dead letter logic for callback
                     success = False
-                    for _ in range(3):
+                    for attempt in range(3):
                         try:
                             if asyncio.iscoroutinefunction(callback):
                                 await callback(data)
@@ -39,10 +38,12 @@ class MessagingClient:
                                 callback(data)
                             success = True
                             break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"PubSub callback attempt {attempt + 1}/3 failed: {e}")
+                            await asyncio.sleep(0.5 * (attempt + 1))
                             
                     if not success:
+                        logger.error(f"PubSub callback dead-lettered after 3 retries for channel {channel.value}")
                         await self.redis.rpush(f"dead_letter:{channel.value}", message["data"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"PubSub message processing error on {channel.value}: {e}")

@@ -19,6 +19,7 @@ Outputs persisted to capital_allocation table.
 import asyncio
 import json
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
@@ -444,7 +445,7 @@ class CapitalAllocator(BaseAgent):
                      redistribution_signals, regime_applied,
                      leverage_cap_applied, metadata)
                 VALUES
-                    (:id, :computed_at::timestamptz, :n_strategies, :method,
+                    (:id, :computed_at, :n_strategies, :method,
                      :final_allocations, :total_exposure,
                      :kelly_weights, :vol_target_weights, :risk_parity_weights,
                      :redistribution_signals, :regime_applied,

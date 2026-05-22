@@ -78,6 +78,7 @@ class ExecutionGateway(BaseAgent):
 
         self._recovery_complete = False
         self._active_lease_order_keys: set[str] = set()
+        self._MAX_ACTIVE_LEASES = 1000
         self._lease_maintenance_task: Optional[asyncio.Task] = None
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -92,14 +93,32 @@ class ExecutionGateway(BaseAgent):
         Background task that periodically renews active execution leases.
         Ensures failover-safety: if this instance dies, leases expire and
         another instance can pick them up.
+        Also prunes stale entries to prevent unbounded lease set growth.
         """
         while self.status == "running":
             try:
+                stale_count = 0
                 for order_key in list(self._active_lease_order_keys):
+                    # Guard against unbounded growth: if set exceeds MAX, aggressively prune
+                    if len(self._active_lease_order_keys) > self._MAX_ACTIVE_LEASES:
+                        logger.warning(
+                            f"Active lease set size {len(self._active_lease_order_keys)} "
+                            f"exceeds MAX ({self._MAX_ACTIVE_LEASES}) — pruning {order_key}"
+                        )
+                        self._active_lease_order_keys.discard(order_key)
+                        stale_count += 1
+                        continue
+
                     renewed = await self.tracker.renew_lease(order_key)
                     if not renewed:
                         logger.warning(f"Lease lost for {order_key} — removing from active set")
                         self._active_lease_order_keys.discard(order_key)
+                        stale_count += 1
+
+                if stale_count > 0:
+                    logger.info(f"Lease maintenance: pruned {stale_count} stale entries, "
+                                f"{len(self._active_lease_order_keys)} active remaining")
+
                 await asyncio.sleep(self.LEASE_RENEWAL_INTERVAL)
             except Exception as e:
                 logger.debug(f"Lease maintenance cycle failed: {e}")
@@ -212,9 +231,9 @@ class ExecutionGateway(BaseAgent):
             import json
             try:
                 params = json.loads(params)
-            except:
+            except Exception:
                 params = {}
-        
+
         symbol = params.get("symbol", "UNKNOWN")
         side = params.get("side", "buy").lower()
         # Default fallback sizing if not specified
@@ -430,17 +449,30 @@ class ExecutionGateway(BaseAgent):
             self._scout_execution_regime = scout.get("execution", {}).get("regime", "")
             self._scout_cache_time = now
         except Exception:
-            pass
+            logger.debug(f"{self.name}: Scout refresh failed")
 
     def _scout_adjusted_qty(self, base_qty: float) -> float:
-        """Reduce order size in stressed market conditions."""
+        """Reduce order size in stressed market conditions.
+        
+        Phase 26D: Also reduces sizing based on entropy when available.
+        """
+        adjusted = base_qty
         if self._scout_liquidity_regime == "thin":
-            return base_qty * 0.5
+            adjusted *= 0.5
         if self._scout_execution_regime in ("degraded", "stressed"):
-            return base_qty * 0.75
+            adjusted *= 0.75
         if self._scout_execution_regime == "unstable":
-            return base_qty * 0.25
-        return base_qty
+            adjusted *= 0.25
+        # Phase 26D: Entropy-based sizing reduction (fetched from risk controller's state)
+        try:
+            entropy_val = self.risk._scout_entropy if hasattr(self.risk, '_scout_entropy') else 0.0
+            if entropy_val > 0.7:
+                adjusted *= 0.5  # 50% size reduction in high entropy
+            elif entropy_val > 0.5:
+                adjusted *= 0.75  # 25% size reduction in moderate entropy
+        except Exception:
+            pass
+        return adjusted
 
     def _scout_adjusted_slippage(self) -> float:
         """Return widened slippage buffer in stressed conditions."""

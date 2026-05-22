@@ -426,7 +426,7 @@ Focus on the MOST IMPORTANT systemic observation. Prioritize:
                      system_state_snapshot, recommendations, advisory_only, metadata, created_at)
                 VALUES
                     (:id, :trace_id, :advisory_type, :confidence, :reasoning_text,
-                     :snapshot::jsonb, :recommendations::jsonb, TRUE, :metadata::jsonb, NOW())
+                     CAST(:snapshot AS jsonb), CAST(:recommendations AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

@@ -164,7 +164,7 @@ class StressTestEngine(BaseAgent):
             VALUES
                 (:id, NOW(), :n_scenarios, :n_positions,
                  :worst_scenario, :min_prob, :max_dd,
-                 :avg_recovery, :results::jsonb)
+                 :avg_recovery, CAST(:results AS jsonb))
             """,
             {
                 "id": uuid.uuid4().hex[:16],

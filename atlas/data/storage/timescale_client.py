@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -22,6 +22,71 @@ def _r6(v: float) -> float:
 
 def _r8(v: float) -> float:
     return round(float(v), 8)
+
+
+def _extract_table_name_from_insert(query: str) -> str:
+    """Heuristic to extract the target table name from an INSERT statement."""
+    m = re.search(r"insert\s+into\s+([a-zA-Z0-9_\.]+)", query, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).split(".")[-1]
+    return "unknown"
+
+# Scout table -> scout_signals mirror configuration.
+# Maps scout-specific insert targets to the columns needed by scout_signals.
+_SCOUT_TABLE_MIRROR_MAP: dict[str, dict[str, Any]] = {
+    "market_regime_memory": {
+        "source": "regime_scout",
+        "symbol_key": "symbol",
+        "signal_type": "regime",
+        "confidence_key": "confidence_score",
+        "signal_data_keys": [
+            "volatility_regime", "trend_regime", "liquidity_regime",
+            "correlation_regime", "realized_volatility", "relative_volume",
+            "atr_percentile", "compression_detected", "expansion_detected",
+            "vwap_deviation_pct",
+        ],
+    },
+    "liquidity_intelligence": {
+        "source": "liquidity_scout",
+        "symbol_key": "symbol",
+        "signal_type": "liquidity",
+        "confidence_key": "liquidity_score",
+        "signal_data_keys": [
+            "avg_spread_bps", "depth_imbalance", "slippage_risk",
+            "market_impact_estimate", "liquidity_regime",
+        ],
+    },
+    "correlation_memory": {
+        "source": "correlation_scout",
+        "symbol_key": None,
+        "signal_type": "correlation",
+        "confidence_key": "avg_pairwise_corr",
+        "signal_data_keys": [
+            "cluster_name", "dominant_factor", "risk_state",
+            "symbols_analyzed", "correlation_spike_detected",
+        ],
+    },
+    "execution_intelligence": {
+        "source": "execution_scout",
+        "symbol_key": "symbol",
+        "signal_type": "execution",
+        "confidence_key": "fill_quality_score",
+        "signal_data_keys": [
+            "avg_slippage_bps", "fill_latency_ms", "rejection_rate",
+            "execution_regime", "sample_size",
+        ],
+    },
+    "external_scout_memory": {
+        "source": "source",
+        "symbol_key": None,
+        "signal_type": "external",
+        "confidence_key": "hypothesis_score",
+        "signal_data_keys": [
+            "source_sub", "sentiment", "source_reliability",
+            "signal_direction", "mentioned_tickers",
+        ],
+    },
+}
 
 
 class BarData(BaseModel):
@@ -195,6 +260,7 @@ class TimescaleClient:
         """Verify the database connection and apply missing migrations."""
         async with self.engine.begin() as conn:
             await conn.execute(text("SELECT 1"))
+
             # Auto-migration: ensure schema additions from schema.sql are applied
             # backtest_trades
             await conn.execute(
@@ -433,6 +499,34 @@ class TimescaleClient:
                     "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quarantined_at DESC)"
                 )
             )
+            # Fix system_logs.agent_id type (agents pass names like 'CoderAgent', not UUIDs)
+            try:
+                await conn.execute(text("""
+                    ALTER TABLE system_logs ALTER COLUMN agent_id TYPE TEXT
+                """))
+            except Exception:
+                pass  # Column may already be TEXT
+
+            # Failed inserts dead-letter queue
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS failed_inserts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    table_name TEXT,
+                    query TEXT,
+                    params JSONB,
+                    reason TEXT,
+                    inserted_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failed_inserts_time ON failed_inserts (inserted_at DESC)"))
+            # Add created_at column to backtest_results (needed by system_health, retirement, drift engines)
+            await conn.execute(
+                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_backtest_results_created ON backtest_results (created_at DESC)")
+            )
+
             # trace_id column on strategies
             await conn.execute(
                 text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT")
@@ -1396,9 +1490,307 @@ class TimescaleClient:
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quarantine (source)"))
+            # ---------------------------------------------------------------
+            # SCOUT_SIGNALS TABLE — anti_poisoning_engine dependency
+            # ---------------------------------------------------------------
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_signals (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    source TEXT,
+                    symbol TEXT,
+                    signal_type TEXT,
+                    confidence_score NUMERIC DEFAULT 0.0,
+                    signal_data JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_source ON scout_signals (source)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_symbol ON scout_signals (symbol)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_created ON scout_signals (created_at DESC)")
+            )
 
+            # ================================================================
+            # PHASE 25 — SCOUT MIRROR DEBUG LOG (signal pipeline observability)
+            # ================================================================
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_mirror_debug_log (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    table_name TEXT,
+                    source TEXT,
+                    symbol TEXT,
+                    signal_type TEXT,
+                    confidence_score NUMERIC DEFAULT 0.0,
+                    success BOOLEAN DEFAULT FALSE,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_debug_log_created ON scout_mirror_debug_log (created_at DESC)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_debug_log_table ON scout_mirror_debug_log (table_name)")
+            )
+
+            # ================================================================
+            # PHASE 26 -- SCOUT-INFLUENCE TRACKING TABLES
+            # ================================================================
+
+            # scout_influence_log -- records every scout influence event on agent behavior
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_influence_log (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    trace_id TEXT,
+                    source_scout TEXT NOT NULL,
+                    target_agent TEXT NOT NULL,
+                    influence_type TEXT NOT NULL,
+                    influence_metric TEXT NOT NULL,
+                    before_value NUMERIC,
+                    after_value NUMERIC,
+                    delta NUMERIC,
+                    confidence NUMERIC DEFAULT 0.0,
+                    regime_context TEXT,
+                    entropy_context NUMERIC,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_source ON scout_influence_log (source_scout)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_target ON scout_influence_log (target_agent)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_created ON scout_influence_log (created_at DESC)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_type ON scout_influence_log (influence_type)")
+            )
+
+            # scout_economic_attribution -- full causal chain tracking
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_economic_attribution (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    trace_id TEXT NOT NULL,
+                    source_scout TEXT NOT NULL,
+                    influence_type TEXT NOT NULL,
+                    target_agent TEXT NOT NULL,
+                    strategy_id TEXT,
+                    strategy_name TEXT,
+                    sharpe_contribution NUMERIC DEFAULT 0.0,
+                    drawdown_contribution NUMERIC DEFAULT 0.0,
+                    pnl_contribution NUMERIC DEFAULT 0.0,
+                    win_rate_contribution NUMERIC DEFAULT 0.0,
+                    attribution_weight NUMERIC DEFAULT 0.0,
+                    survived_validation BOOLEAN DEFAULT FALSE,
+                    regime_at_time TEXT,
+                    entropy_at_time NUMERIC,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_source ON scout_economic_attribution (source_scout)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_trace ON scout_economic_attribution (trace_id)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_strategy ON scout_economic_attribution (strategy_id)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_created ON scout_economic_attribution (created_at DESC)")
+            )
+
+            # Record schema version
+            await conn.execute(
+                text("INSERT INTO schema_version (version, description) VALUES ('v26.0', 'Phase 26: Scout influence tracking, economic attribution, entropy governance') ON CONFLICT DO NOTHING")
+            )
+
+
+            # ================================================================
+            # PHASE 24 — SCHEMA DRIFT FIXES (post-soak audit remediation)
+            # ================================================================
+
+            # ---------------------------------------------------------------
+            # EVENT_STORE: The CREATE TABLE below defines a minimal set of
+            # columns, but EventStore.append_event() writes a DIFFERENT set
+            # of columns.  We must add ALL columns that the code expects.
+            # ---------------------------------------------------------------
+
+            # event_store.sequence — required by EventStore for ordering
+            await conn.execute(
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 0")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_events_sequence ON event_store (sequence)")
+            )
+
+            # event_store.version — used by EventStore.append_event() (inserted as :version)
+            await conn.execute(
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS version TEXT DEFAULT '1.0'")
+            )
+
+            # event_store.metadata — JSONB metadata column
+            await conn.execute(
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
+            )
+
+            # event_store.hash_prev — previous event hash for chain integrity
+            await conn.execute(
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_prev TEXT")
+            )
+
+            # event_store.hash_self — self-hash for tamper detection
+            await conn.execute(
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_self TEXT")
+            )
+
+            # ---------------------------------------------------------------
+            # AUDIT_LEDGER: The CREATE TABLE uses different column names than
+            # AuditLedger.record().  We add ALL columns the code writes.
+            # ---------------------------------------------------------------
+
+            # audit_ledger.resource_type — used by AuditLedger.record()
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_type TEXT")
+            )
+
+            # audit_ledger.resource_id — used by AuditLedger.record()
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_id TEXT")
+            )
+
+            # audit_ledger.details — JSONB details column
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS details JSONB DEFAULT '{}'::jsonb")
+            )
+
+            # audit_ledger.severity — severity level column
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS severity TEXT DEFAULT 'info'")
+            )
+
+            # audit_ledger.hash_prev — previous entry hash
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_prev TEXT")
+            )
+
+            # audit_ledger.hash_self — self-hash
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_self TEXT")
+            )
+
+            # audit_ledger.sequence — deterministic ordering for per-aggregate hash chain verification
+            await conn.execute(
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 1")
+            )
+            await conn.execute(
+                text("DROP INDEX IF EXISTS idx_audit_sequence")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_audit_trace_sequence ON audit_ledger (trace_id, sequence)")
+            )
+
+            # paper_trades.id — missing UUID primary key
+            await conn.execute(
+                text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS id UUID DEFAULT gen_random_uuid()")
+            )
+            # paper_trades.qty — generated column backed by quantity so both column names work
+            await conn.execute(
+                text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS qty NUMERIC GENERATED ALWAYS AS (quantity) STORED")
+            )
+
+            # strategies.mutation_type — used by mutation analysis queries
+            await conn.execute(
+                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS mutation_type TEXT")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_strategies_mutation_type ON strategies (mutation_type)")
+            )
+
+            # lifecycle_events.agent_name — alias for actor, used by metrics queries
+            await conn.execute(
+                text("ALTER TABLE lifecycle_events ADD COLUMN IF NOT EXISTS agent_name TEXT")
+            )
+
+            # external_scout_memory.details — used by scout performance tracking
+            await conn.execute(
+                text("ALTER TABLE external_scout_memory ADD COLUMN IF NOT EXISTS details TEXT")
+            )
+
+            # strategies.generation_batch — missing column used by IdeatorV2
+            await conn.execute(
+                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS generation_batch TEXT")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_strategies_batch ON strategies (generation_batch)")
+            )
+
+            # ================================================================
+            # SCHEMA VERSIONING — Phase 24: Post-migration validation
+            # ================================================================
+            from loguru import logger
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ DEFAULT NOW(),
+                    description TEXT,
+                    checksum TEXT
+                )
+            """))
+            await conn.execute(
+                text("INSERT INTO schema_version (version, description) VALUES ('v24.0', 'Phase 24: Schema drift remediation, column alignment, start-up validation') ON CONFLICT DO NOTHING")
+            )
+
+            # Verify critical columns that are required by the code
+            # Runs AFTER all migrations to avoid false-positive warnings
+            _required_columns = [
+                ("event_store", "version", "EventStore.append_event"),
+                ("event_store", "metadata", "EventStore.append_event"),
+                ("event_store", "hash_prev", "EventStore hash chain"),
+                ("event_store", "hash_self", "EventStore hash chain"),
+                ("event_store", "sequence", "EventStore ordering"),
+                ("audit_ledger", "resource_type", "AuditLedger.record"),
+                ("audit_ledger", "resource_id", "AuditLedger.record"),
+                ("audit_ledger", "details", "AuditLedger.record"),
+                ("audit_ledger", "severity", "AuditLedger.record"),
+                ("audit_ledger", "hash_prev", "AuditLedger hash chain"),
+                ("audit_ledger", "hash_self", "AuditLedger hash chain"),
+                ("audit_ledger", "sequence", "AuditLedger hash chain ordering"),
+                ("external_scout_memory", "details", "Scout performance tracking"),
+                ("strategies", "mutation_type", "Mutation analysis"),
+                ("strategies", "generation_batch", "IdeatorV2"),
+                ("lifecycle_events", "agent_name", "Metrics queries"),
+                ("correlation_memory", "correlation_value", "SystemicRiskEngine"),
+                ("paper_trades", "id", "Primary key"),
+                ("backtest_results", "created_at", "System health, retirement"),
+            ]
+            _missing = []
+            for _table, _col, _usage in _required_columns:
+                r = await conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name = :t AND column_name = :c"),
+                    {"t": _table, "c": _col},
+                )
+                if r.fetchone() is None:
+                    _missing.append(f"{_table}.{_col} ({_usage})")
+            if _missing:
+                logger.warning(f"Schema validation: {len(_missing)} critical columns still missing — {', '.join(_missing[:5])}...")
+            else:
+                logger.info("Schema validation: All critical columns present ✅")
+
+    @staticmethod
+    def _strip_pg_casts(query: str) -> str:
+        return re.sub(r':([a-zA-Z_][a-zA-Z0-9_]*)::[a-zA-Z_]+', r':', query)
 
     async def _execute_insert(self, query: str, params: Dict[str, Any]) -> None:
+        query = self._strip_pg_casts(query)
         normalized_params = normalize_db_params(params)
         query_l = query.strip().lower()
         if query_l.startswith("insert into external_scout_memory"):
@@ -1408,7 +1800,55 @@ class TimescaleClient:
                 return
             normalized_params = validation.normalized_payload
         async with self.engine.begin() as conn:
-            await conn.execute(text(query), normalized_params)
+            try:
+                res = await conn.execute(text(query), normalized_params)
+                # rowcount may be None depending on driver; treat None as unknown
+                rc = getattr(res, "rowcount", None)
+                if rc == 0:
+                    # Insert silently affected 0 rows — capture dead-letter for investigation
+                    table_name = _extract_table_name_from_insert(query)
+                    await conn.execute(
+                        text("""
+                        INSERT INTO failed_inserts (table_name, query, params, reason)
+                        VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
+                        """),
+                        {
+                            "table_name": table_name,
+                            "query": query,
+                            "params": safe_json_dumps(normalized_params),
+                            "reason": "zero_rowcount",
+                        },
+                    )
+
+                else:
+                    # Successful insert -- mirror to scout_signals if applicable
+                    table_name = _extract_table_name_from_insert(query)
+                    await self._mirror_to_scout_signals(table_name, normalized_params)
+
+            except Exception as e:
+                # On exception, persist the failed insert for offline debugging and continue
+                try:
+                    table_name = _extract_table_name_from_insert(query)
+                    await conn.execute(
+                        text("""
+                        INSERT INTO failed_inserts (table_name, query, params, reason)
+                        VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
+                        """),
+                        {
+                            "table_name": table_name,
+                            "query": query,
+                            "params": safe_json_dumps(normalized_params),
+                            "reason": str(e),
+                        },
+                    )
+                except Exception:
+                    # Last resort: log and move on
+                    from loguru import logger
+
+                    logger.error(f"Failed to record failed_insert for query: {e}")
+                from loguru import logger
+
+                logger.warning(f"DB insert failed: {e}")
 
     async def _quarantine_scout_payload(self, payload: dict[str, Any], reasons: list[str]) -> None:
         async with self.engine.begin() as conn:
@@ -1416,7 +1856,7 @@ class TimescaleClient:
                 text(
                     """
                     INSERT INTO scout_quarantine (source, source_sub, reasons, raw_payload)
-                    VALUES (:source, :source_sub, :reasons::jsonb, :raw_payload::jsonb)
+                    VALUES (:source, :source_sub, CAST(:reasons AS jsonb), CAST(:raw_payload AS jsonb))
                     """
                 ),
                 {
@@ -1427,10 +1867,292 @@ class TimescaleClient:
                 },
             )
 
+    async def _mirror_to_scout_signals(self, table_name: str, params: dict[str, Any]) -> None:
+        """Auto-mirror scout inserts to scout_signals for pipeline consumption."""
+        config = _SCOUT_TABLE_MIRROR_MAP.get(table_name)
+        if config is None:
+            return
+
+        # Use config source value as a literal static name, unless the param key
+        # actually exists in the insert params (e.g., external_scout_memory has a
+        # dynamic "source" field like "youtube" / "discord").
+        if config["source"] in params:
+            raw_source = params[config["source"]]
+        else:
+            raw_source = config["source"]
+        symbol = None
+        if config.get("symbol_key"):
+            symbol = params.get(config["symbol_key"])
+
+        confidence = None
+        if config.get("confidence_key"):
+            try:
+                confidence = float(params.get(config["confidence_key"], 0) or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+
+        signal_data = {}
+        for key in config.get("signal_data_keys", []):
+            if key in params:
+                val = params[key]
+                if isinstance(val, (list, dict)):
+                    import json
+                    signal_data[key] = json.loads(json.dumps(val, default=str))
+                else:
+                    signal_data[key] = val
+
+        insert_query = """
+            INSERT INTO scout_signals (source, symbol, signal_type, confidence_score, signal_data)
+            VALUES (:source, :symbol, :signal_type, :confidence_score, CAST(:signal_data AS jsonb))
+        """
+        async with self.engine.begin() as conn:
+            success = False
+            error_msg = None
+            try:
+                await conn.execute(
+                    text(insert_query),
+                    {
+                        "source": str(raw_source),
+                        "symbol": str(symbol) if symbol else None,
+                        "signal_type": config["signal_type"],
+                        "confidence_score": confidence,
+                        "signal_data": safe_json_dumps(signal_data),
+                    },
+                )
+                success = True
+            except Exception as e:
+                error_msg = str(e)[:500]
+                # Mirror failures are non-fatal -- do not poison the primary insert
+
+            # Phase 25 Step 3: Debug mode — log every mirror attempt
+            try:
+                await conn.execute(
+                    text("""
+                        INSERT INTO scout_mirror_debug_log
+                            (table_name, source, symbol, signal_type, confidence_score, success, error_message)
+                        VALUES (:tn, :src, :sym, :st, :conf, :ok, :err)
+                    """),
+                    {
+                        "tn": table_name,
+                        "src": str(raw_source),
+                        "sym": str(symbol) if symbol else None,
+                        "st": config["signal_type"],
+                        "conf": confidence,
+                        "ok": success,
+                        "err": error_msg,
+                    },
+                )
+            except Exception as log_e:
+                from loguru import logger
+                logger.debug(f"Mirror debug log insertion failed: {log_e}")
+
     async def fetchval(self, query: str, params: Optional[Dict[str, Any]] = None):
         async with self.engine.connect() as conn:
             result = await conn.execute(text(query), params or {})
             return result.scalar()
+
+    # ================================================================
+    # PHASE 26 -- SCOUT INFLUENCE TRACKING HELPERS
+    # ================================================================
+
+    async def log_scout_influence(
+        self,
+        source_scout: str,
+        target_agent: str,
+        influence_type: str,
+        influence_metric: str,
+        before_value: float | None = None,
+        after_value: float | None = None,
+        delta: float | None = None,
+        confidence: float = 0.0,
+        regime_context: str | None = None,
+        entropy_context: float | None = None,
+        metadata: dict | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Log a scout influence event for Phase 26 coupling analysis."""
+        import uuid
+        try:
+            await self._execute_insert(
+                """
+                INSERT INTO scout_influence_log
+                    (trace_id, source_scout, target_agent, influence_type, influence_metric,
+                     before_value, after_value, delta, confidence, regime_context,
+                     entropy_context, metadata)
+                VALUES
+                    (:trace_id, :source, :target, :itype, :imetric,
+                     :before, :after, :delta, :conf, :regime,
+                     :entropy, CAST(:meta AS jsonb))
+                """,
+                {
+                    "trace_id": trace_id or uuid.uuid4().hex[:16],
+                    "source": source_scout,
+                    "target": target_agent,
+                    "itype": influence_type,
+                    "imetric": influence_metric,
+                    "before": before_value,
+                    "after": after_value,
+                    "delta": delta,
+                    "conf": confidence,
+                    "regime": regime_context,
+                    "entropy": entropy_context,
+                    "meta": safe_json_dumps(metadata or {}),
+                },
+            )
+        except Exception as e:
+            from loguru import logger
+            logger.debug(f"log_scout_influence failed: {e}")
+
+    async def log_economic_attribution(
+        self,
+        source_scout: str,
+        influence_type: str,
+        target_agent: str,
+        strategy_id: str | None = None,
+        strategy_name: str | None = None,
+        sharpe_contribution: float = 0.0,
+        drawdown_contribution: float = 0.0,
+        pnl_contribution: float = 0.0,
+        win_rate_contribution: float = 0.0,
+        attribution_weight: float = 0.0,
+        survived_validation: bool = False,
+        regime_at_time: str | None = None,
+        entropy_at_time: float | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Record full economic attribution for a scout-influenced decision."""
+        import uuid
+        trace_id = uuid.uuid4().hex[:16]
+        try:
+            await self._execute_insert(
+                """
+                INSERT INTO scout_economic_attribution
+                    (trace_id, source_scout, influence_type, target_agent,
+                     strategy_id, strategy_name,
+                     sharpe_contribution, drawdown_contribution, pnl_contribution,
+                     win_rate_contribution, attribution_weight,
+                     survived_validation, regime_at_time, entropy_at_time, metadata)
+                VALUES
+                    (:trace_id, :source, :itype, :target,
+                     :sid, :sname,
+                     :sharpe, :dd, :pnl,
+                     :wr, :weight,
+                     :survived, :regime, :entropy, CAST(:meta AS jsonb))
+                """,
+                {
+                    "trace_id": trace_id,
+                    "source": source_scout,
+                    "itype": influence_type,
+                    "target": target_agent,
+                    "sid": strategy_id,
+                    "sname": strategy_name,
+                    "sharpe": sharpe_contribution,
+                    "dd": drawdown_contribution,
+                    "pnl": pnl_contribution,
+                    "wr": win_rate_contribution,
+                    "weight": attribution_weight,
+                    "survived": survived_validation,
+                    "regime": regime_at_time,
+                    "entropy": entropy_at_time,
+                    "meta": safe_json_dumps(metadata or {}),
+                },
+            )
+        except Exception as e:
+            from loguru import logger
+            logger.debug(f"log_economic_attribution failed: {e}")
+
+    async def get_scout_influence_summary(self, source_scout: str | None = None) -> list[dict]:
+        """Get summary of scout influence events."""
+        import json
+        async with self.engine.connect() as conn:
+            if source_scout:
+                r = await conn.execute(
+                    text("""
+                        SELECT source_scout, target_agent, influence_type, influence_metric,
+                               COUNT(*) as event_count,
+                               AVG(ABS(COALESCE(delta, 0))) as avg_abs_delta,
+                               AVG(COALESCE(confidence, 0)) as avg_confidence,
+                               MIN(created_at) as first_event,
+                               MAX(created_at) as last_event
+                        FROM scout_influence_log
+                        WHERE source_scout = :src
+                        GROUP BY source_scout, target_agent, influence_type, influence_metric
+                        ORDER BY event_count DESC
+                    """),
+                    {"src": source_scout},
+                )
+            else:
+                r = await conn.execute(
+                    text("""
+                        SELECT source_scout, target_agent, influence_type, influence_metric,
+                               COUNT(*) as event_count,
+                               AVG(ABS(COALESCE(delta, 0))) as avg_abs_delta,
+                               AVG(COALESCE(confidence, 0)) as avg_confidence
+                        FROM scout_influence_log
+                        GROUP BY source_scout, target_agent, influence_type, influence_metric
+                        ORDER BY event_count DESC
+                    """),
+                )
+            results = []
+            for row in r.fetchall():
+                results.append({
+                    "source_scout": row[0],
+                    "target_agent": row[1],
+                    "influence_type": row[2],
+                    "influence_metric": row[3],
+                    "event_count": row[4],
+                    "avg_abs_delta": float(row[5] or 0),
+                    "avg_confidence": float(row[6] or 0),
+                })
+            return results
+
+    async def get_economic_attribution(
+        self, source_scout: str | None = None, strategy_id: str | None = None
+    ) -> list[dict]:
+        """Get economic attribution records."""
+        import json
+        async with self.engine.connect() as conn:
+            conditions = []
+            params = {}
+            if source_scout:
+                conditions.append("source_scout = :src")
+                params["src"] = source_scout
+            if strategy_id:
+                conditions.append("strategy_id = :sid")
+                params["sid"] = strategy_id
+            where_clause = " AND ".join(conditions) if conditions else "TRUE"
+            r = await conn.execute(
+                text(f"""
+                    SELECT source_scout, influence_type, target_agent,
+                           strategy_name, sharpe_contribution, drawdown_contribution,
+                           pnl_contribution, win_rate_contribution, attribution_weight,
+                           survived_validation, regime_at_time, entropy_at_time, created_at
+                    FROM scout_economic_attribution
+                    WHERE {where_clause}
+                    ORDER BY created_at DESC
+                    LIMIT 100
+                """),
+                params,
+            )
+            results = []
+            for row in r.fetchall():
+                results.append({
+                    "source_scout": row[0],
+                    "influence_type": row[1],
+                    "target_agent": row[2],
+                    "strategy_name": row[3],
+                    "sharpe_contribution": float(row[4] or 0),
+                    "drawdown_contribution": float(row[5] or 0),
+                    "pnl_contribution": float(row[6] or 0),
+                    "win_rate_contribution": float(row[7] or 0),
+                    "attribution_weight": float(row[8] or 0),
+                    "survived_validation": bool(row[9]),
+                    "regime_at_time": row[10],
+                    "entropy_at_time": float(row[11] or 0) if row[11] else None,
+                })
+            return results
+
+
 
     async def write_bars(self, symbol: str, data: BarData) -> None:
         """Insert to market_data_l1 (idempotent — skips duplicates)"""
@@ -1583,7 +2305,7 @@ class TimescaleClient:
             INSERT INTO features (time, symbol, feature_name, value)
             VALUES (:time, :symbol, :feature_name, :value)
         """
-        time_now = datetime.utcnow()
+        time_now = datetime.now(timezone.utc)
         ratio_features = {
             "returns",
             "log_returns",
@@ -1693,7 +2415,7 @@ class TimescaleClient:
             VALUES (:time, :agent_id, :level, :message, :metadata)
         """
         params = {
-            "time": datetime.utcnow(),
+            "time": datetime.now(timezone.utc),
             "agent_id": str(agent_id),
             "level": level,
             "message": message,
@@ -1917,7 +2639,7 @@ class TimescaleClient:
             "code": "",
             "parameters": json.dumps(spec),
             "status": status,
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
             "author_agent": author_agent,
             "prompt": prompt,
             "raw_response": raw_response,
@@ -2195,6 +2917,53 @@ class TimescaleClient:
                 pass
 
         return results
+
+    async def get_scout_signal_summary(self) -> dict:
+        """
+        Fetch compressed summary of recent scout_signals grouped by source and signal_type.
+        Phase 25D: Used by IdeatorAgentV2 to inject structured scout data into ideation prompts.
+        Returns: {by_source: {...}, recent: [...], total_signals: int}
+        """
+        async with self.engine.connect() as conn:
+            try:
+                result = await conn.execute(text("""
+                    SELECT source, signal_type, COUNT(*) as cnt,
+                           ROUND(AVG(confidence_score)::numeric, 2) as avg_conf
+                    FROM scout_signals
+                    GROUP BY source, signal_type
+                    ORDER BY cnt DESC
+                """))
+                by_source = {}
+                for row in result.fetchall():
+                    key = (row[0], row[1])  # (source, signal_type)
+                    by_source[key] = {
+                        "count": row[2],
+                        "avg_confidence": float(row[3]) if row[3] else 0.0,
+                    }
+            except Exception:
+                by_source = {}
+
+            try:
+                result = await conn.execute(text("""
+                    SELECT source, signal_type, symbol, confidence_score, created_at
+                    FROM scout_signals
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """))
+                recent = []
+                for row in result.fetchall():
+                    recent.append({
+                        "source": row[0],
+                        "type": row[1],
+                        "symbol": row[2],
+                        "confidence": float(row[3]) if row[3] else 0.0,
+                        "created_at": str(row[4]) if row[4] else None,
+                    })
+            except Exception:
+                recent = []
+
+        total = sum(info["count"] for info in by_source.values())
+        return {"by_source": by_source, "recent": recent, "total_signals": total}
 
     async def get_validation_intelligence(self) -> dict:
         """

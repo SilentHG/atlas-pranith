@@ -10,7 +10,7 @@ Monitors YouTube financial channels for:
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -68,7 +68,7 @@ class YouTubeScout(BaseAgent):
                     "source": "youtube",
                     "channel": channel,
                     "source_reliability": reliability,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "title_sentiment": round(sentiment, 4),
                     "description_sentiment": round(sentiment * float(np.random.uniform(0.8, 1.2)), 4),
                     "view_count": int(np.random.poisson(50000)),
@@ -106,7 +106,7 @@ class YouTubeScout(BaseAgent):
                          hypothesis_score, signal_direction, metadata)
                     VALUES
                         (:id, :source, :source_sub, :source_reliability,
-                         :timestamp::timestamptz, :sentiment, :mentioned_tickers,
+                         :timestamp, :sentiment, :mentioned_tickers,
                          :hypothesis_score, :signal_direction, :metadata)
                     """,
                     {

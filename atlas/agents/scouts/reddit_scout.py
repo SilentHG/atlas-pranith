@@ -212,7 +212,7 @@ class RedditScout(BaseAgent):
                          hypothesis_score, signal_direction, metadata)
                     VALUES
                         (:id, :source, :source_sub, :source_reliability,
-                         :timestamp::timestamptz, :sentiment, :mentioned_tickers,
+                         :timestamp, :sentiment, :mentioned_tickers,
                          :hypothesis_score, :signal_direction, :metadata)
                     """,
                     {

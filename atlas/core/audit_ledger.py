@@ -59,12 +59,15 @@ class AuditLedger:
     ) -> str:
         """Record an immutable audit entry. Returns entry_id."""
         entry_id = uuid.uuid4().hex[:16]
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
 
-        # Get previous hash for chain
-        prev_hash = await self._get_last_hash()
+        # Compute next sequence for this trace_id (per-trace_id incrementing)
+        sequence = await self._next_sequence(trace_id)
 
-        # Build content for self-hash
+        # Get previous hash for chain (per-trace_id chain)
+        prev_hash = await self._get_last_hash(trace_id)
+
+        # Build content for self-hash (sequence included for deterministic hash)
         content = {
             "id": entry_id,
             "event_type": event_type,
@@ -75,8 +78,9 @@ class AuditLedger:
             "details": details or {},
             "severity": severity,
             "trace_id": trace_id,
+            "sequence": sequence,
             "hash_prev": prev_hash,
-            "created_at": now,
+            "created_at": now.isoformat(),
         }
         hash_self = hashlib.sha256(
             json.dumps(content, sort_keys=True).encode("utf-8")
@@ -86,10 +90,11 @@ class AuditLedger:
             """
             INSERT INTO audit_ledger
                 (id, event_type, actor, action, resource_type, resource_id,
-                 details, severity, trace_id, hash_prev, hash_self, created_at)
+                 details, severity, trace_id, sequence, hash_prev, hash_self, created_at)
             VALUES
                 (:id, :event_type, :actor, :action, :resource_type, :resource_id,
-                 :details::jsonb, :severity, :trace_id, :hash_prev, :hash_self, :created_at::timestamptz)
+                 CAST(:details AS jsonb), :severity, :trace_id, :sequence,
+                 :hash_prev, :hash_self, :created_at)
             """,
             {
                 "id": entry_id,
@@ -101,13 +106,14 @@ class AuditLedger:
                 "details": json.dumps(details or {}),
                 "severity": severity,
                 "trace_id": trace_id,
+                "sequence": sequence,
                 "hash_prev": prev_hash,
                 "hash_self": hash_self,
-                "created_at": now,
+                "created_at": now.isoformat(),
             },
         )
 
-        logger.info(f"Audit: {event_type} | {actor} | {action} | {resource_type}:{resource_id}")
+        logger.info(f"Audit: {event_type} | {actor} | {action} | {resource_type}:{resource_id} | seq={sequence}")
         return entry_id
 
     async def get_entries(
@@ -138,7 +144,7 @@ class AuditLedger:
             result = await conn.execute(
                 text(f"""
                     SELECT id, event_type, actor, action, resource_type, resource_id,
-                           details, severity, trace_id, hash_prev, hash_self, created_at
+                           details, severity, trace_id, sequence, hash_prev, hash_self, created_at
                     FROM audit_ledger
                     WHERE {where_clause}
                     ORDER BY created_at DESC
@@ -151,15 +157,16 @@ class AuditLedger:
     async def verify_chain(self) -> dict:
         """
         Verify the integrity of the entire audit chain.
+        Verifies per-trace_id groups independently using sequence ordering.
         Returns verification report.
         """
         async with self.db.engine.connect() as conn:
             result = await conn.execute(
                 text("""
                     SELECT id, event_type, actor, action, resource_type, resource_id,
-                           details, severity, trace_id, hash_prev, hash_self, created_at
+                           details, severity, trace_id, sequence, hash_prev, hash_self, created_at
                     FROM audit_ledger
-                    ORDER BY created_at ASC
+                    ORDER BY COALESCE(trace_id, ''), sequence ASC
                 """),
             )
             rows = result.fetchall()
@@ -168,11 +175,19 @@ class AuditLedger:
             return {"valid": True, "entries_checked": 0}
 
         violations = []
-        prev_hash = None
+        # Group entries per trace_id for independent hash chain verification
+        prev_hash: str | None = None
+        prev_trace_id: str | None = None
         for i, row in enumerate(rows):
             entry = self._row_to_entry(row)
+            current_trace_id = entry["trace_id"]
 
-            # Verify self-hash
+            # Reset chain when trace_id changes (per-trace_id chains)
+            if current_trace_id != prev_trace_id:
+                prev_hash = None
+                prev_trace_id = current_trace_id
+
+            # Build content for self-hash (must match record() exactly)
             content = {
                 "id": entry["id"],
                 "event_type": entry["event_type"],
@@ -182,7 +197,8 @@ class AuditLedger:
                 "resource_id": entry["resource_id"],
                 "details": entry["details"],
                 "severity": entry["severity"],
-                "trace_id": entry["trace_id"],
+                "trace_id": current_trace_id,
+                "sequence": entry["sequence"],
                 "hash_prev": entry["hash_prev"],
                 "created_at": entry["created_at"],
             }
@@ -193,9 +209,9 @@ class AuditLedger:
             if expected_hash != entry["hash_self"]:
                 violations.append(f"Entry {i} ({entry['id']}): self-hash mismatch")
 
-            if i > 0 and entry["hash_prev"] != prev_hash:
+            if prev_hash is not None and entry["hash_prev"] != prev_hash:
                 violations.append(
-                    f"Entry {i} ({entry['id']}): chain broken "
+                    f"Entry {i} ({entry['id']}): chain broken in {current_trace_id} "
                     f"(expected prev_hash={prev_hash[:16]}...)"
                 )
 
@@ -222,9 +238,9 @@ class AuditLedger:
                         COUNT(CASE WHEN severity = 'critical' THEN 1 END) as critical_events,
                         COUNT(CASE WHEN severity = 'warning' THEN 1 END) as warnings
                     FROM audit_ledger
-                    WHERE created_at > NOW() - INTERVAL ':hours hours'
+                    WHERE created_at > NOW() - INTERVAL :delta
                 """),
-                {"hours": hours},
+                {"delta": f"{hours} hours"},
             )
             row = r.fetchone()
             if not row:
@@ -234,10 +250,10 @@ class AuditLedger:
                 text("""
                     SELECT event_type, COUNT(*) as cnt
                     FROM audit_ledger
-                    WHERE created_at > NOW() - INTERVAL ':hours hours'
+                    WHERE created_at > NOW() - INTERVAL :delta
                     GROUP BY event_type ORDER BY cnt DESC
                 """),
-                {"hours": hours},
+                {"delta": f"{hours} hours"},
             )
             by_type = {str(r[0]): r[1] for r in r2.fetchall()}
 
@@ -250,14 +266,41 @@ class AuditLedger:
                 "by_type": by_type,
             }
 
-    async def _get_last_hash(self) -> Optional[str]:
+    async def _next_sequence(self, trace_id: Optional[str]) -> int:
+        """Compute the next sequence number for the given trace_id."""
         async with self.db.engine.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT hash_self FROM audit_ledger
-                    ORDER BY created_at DESC LIMIT 1
-                """),
-            )
+            if trace_id:
+                result = await conn.execute(
+                    text("SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_ledger WHERE trace_id = :trace_id"),
+                    {"trace_id": trace_id},
+                )
+            else:
+                result = await conn.execute(
+                    text("SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit_ledger WHERE trace_id IS NULL")
+                )
+            row = result.fetchone()
+            return int(row[0]) if row else 1
+
+    async def _get_last_hash(self, trace_id: Optional[str] = None) -> Optional[str]:
+        """Get the last hash_self for the given trace_id (or global if trace_id is None)."""
+        async with self.db.engine.connect() as conn:
+            if trace_id:
+                result = await conn.execute(
+                    text("""
+                        SELECT hash_self FROM audit_ledger
+                        WHERE trace_id = :trace_id
+                        ORDER BY sequence DESC LIMIT 1
+                    """),
+                    {"trace_id": trace_id},
+                )
+            else:
+                result = await conn.execute(
+                    text("""
+                        SELECT hash_self FROM audit_ledger
+                        WHERE trace_id IS NULL
+                        ORDER BY sequence DESC LIMIT 1
+                    """),
+                )
             row = result.fetchone()
             return str(row[0]) if row else None
 
@@ -278,7 +321,8 @@ class AuditLedger:
             "details": details,
             "severity": str(row[7]),
             "trace_id": str(row[8]) if row[8] else None,
-            "hash_prev": str(row[9]) if row[9] else None,
-            "hash_self": str(row[10]),
-            "created_at": row[11].isoformat() if hasattr(row[11], "isoformat") else str(row[11]),
+            "sequence": int(row[9]) if row[9] is not None else 0,
+            "hash_prev": str(row[10]) if row[10] else None,
+            "hash_self": str(row[11]),
+            "created_at": row[12].isoformat() if hasattr(row[12], "isoformat") else str(row[12]),
         }

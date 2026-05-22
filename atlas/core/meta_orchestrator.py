@@ -11,6 +11,7 @@ class MetaOrchestrator:
         self.agents = agents
         # Holds registry of all agent instances
         self.agent_map = {a.agent_id: a for a in agents}
+        self._monitor_task: asyncio.Task | None = None
 
     async def start_all(self):
         # Spawn agents in order:
@@ -40,7 +41,15 @@ class MetaOrchestrator:
                 *(a.start() for a in ideator_agents), return_exceptions=True
             )
 
-        asyncio.create_task(self._monitor_loop())
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def stop(self):
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
 
     async def _monitor_loop(self):
         # runs every 30 seconds

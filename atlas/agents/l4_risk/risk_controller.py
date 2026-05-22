@@ -34,7 +34,34 @@ class RiskController(BaseAgent):
         self.db_client = db_client
         self.messaging = MessagingClient(redis_client)
         self.RUN_INTERVAL = 30
+        self._scout_entropy: float = 0.0
+        self._scout_disagreement: float = 0.0
+        self._entropy_cache_time: float = 0.0
+        self._ENTROPY_CACHE_TTL: float = 300.0  # refresh every 5 min
+        self._entropy_leverage_cap: float = 1.0  # normal leverage
 
+
+
+    async def _refresh_entropy_context(self):
+        """Phase 26D: Refresh scout entropy from influence log."""
+        import time
+        now = time.time()
+        if now - self._entropy_cache_time < self._ENTROPY_CACHE_TTL:
+            return
+        try:
+            summary = await self.db_client.get_scout_influence_summary(hours=24)
+            if summary and len(summary) > 0:
+                entropy_vals = [row.get('entropy_context', 0) or 0 for row in summary]
+                self._scout_entropy = sum(entropy_vals) / max(1, len(entropy_vals))
+                # Disagreement = standard deviation of entropy values
+                if len(entropy_vals) > 1:
+                    mean = self._scout_entropy
+                    variance = sum((v - mean)**2 for v in entropy_vals) / len(entropy_vals)
+                    self._scout_disagreement = min(1.0, variance * 4)  # normalize
+            self._entropy_cache_time = now
+        except Exception as e:
+            logger.debug(f"{self.name}: Entropy refresh failed: {e}")
+    
     async def run(self):
         while self.status == "running":
             try:
@@ -58,13 +85,30 @@ class RiskController(BaseAgent):
                 # 4. If daily_loss breaches -2%: publish risk_alert + trigger kill switch
                 if daily_loss_pct <= self.LIMITS["max_daily_loss_pct"]:
                     reason = f"Daily loss breached limit: {daily_loss_pct:.2%}"
-                    await self._trigger_kill_switch(reason)
-                    
-                # 5. If weekly_loss breaches -4%: publish risk_alert + trigger kill switch
+                    await self._trigger_kill_switch(reason)                # 5. If weekly_loss breaches -4%: publish risk_alert + trigger kill switch
                 if weekly_loss_pct <= self.LIMITS["max_weekly_loss_pct"]:
                     reason = f"Weekly loss breached limit: {weekly_loss_pct:.2%}"
                     await self._trigger_kill_switch(reason)
-                
+
+                # Phase 26D: Entropy-governed leverage and exposure limits
+                await self._refresh_entropy_context()
+                entropy = self._scout_entropy
+
+                # High entropy -> reduce leverage cap
+                if entropy > 0.7:
+                    self._entropy_leverage_cap = 0.5  # 50% leverage cut
+                    logger.info(f"{self.name}: High entropy ({entropy:.2f}) -> leverage cap 0.5")
+                elif entropy > 0.5:
+                    self._entropy_leverage_cap = 0.75  # 25% leverage cut
+                else:
+                    self._entropy_leverage_cap = 1.0
+
+                # High disagreement -> wider diversification forced
+                if self._scout_disagreement > 0.6:
+                    self.LIMITS["max_single_position_pct"] = 0.05  # 5% max position
+                else:
+                    self.LIMITS["max_single_position_pct"] = 0.10  # 10% normal
+
                 # 6. Log all checks
                 await self.db_client.log(
                     self.agent_id,

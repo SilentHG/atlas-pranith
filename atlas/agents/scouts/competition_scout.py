@@ -10,7 +10,7 @@ Monitors trading/data science competitions for:
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -68,7 +68,7 @@ class CompetitionScout(BaseAgent):
                     "source": "competition",
                     "platform": platform,
                     "source_reliability": reliability,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc),
                     "innovation_score": round(innovation_score, 4),
                     "feature_families": list(np.random.choice(
                         ["technical", "microstructure", "order_flow", "sentiment", "alternative", "correlation"],
@@ -109,7 +109,7 @@ class CompetitionScout(BaseAgent):
                          hypothesis_score, signal_direction, metadata)
                     VALUES
                         (:id, :source, :source_sub, :source_reliability,
-                         :timestamp::timestamptz, :sentiment, :mentioned_tickers,
+                         :timestamp, :sentiment, :mentioned_tickers,
                          :hypothesis_score, :signal_direction, :metadata)
                     """,
                     {

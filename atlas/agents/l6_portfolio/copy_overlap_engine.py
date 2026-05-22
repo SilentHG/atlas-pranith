@@ -119,8 +119,8 @@ class CopyOverlapEngine(BaseAgent):
                  hidden_concentration, n_leaders_analyzed, metadata, analyzed_at)
             VALUES
                 (:id, :trace_id, :fid, :overlap, :conc_risk,
-                 :div_pen, :dup_exp::jsonb, :corr_leaders::jsonb,
-                 :hidden_conc::jsonb, :n_leaders, :meta::jsonb, NOW())
+                 :div_pen, CAST(:dup_exp AS jsonb), CAST(:corr_leaders AS jsonb),
+                 CAST(:hidden_conc AS jsonb), :n_leaders, CAST(:meta AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],

@@ -10,7 +10,7 @@ Monitors financial podcast content for:
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -68,7 +68,7 @@ class PodcastScout(BaseAgent):
                     "source": "podcast",
                     "podcast": podcast,
                     "source_reliability": reliability,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "episode_sentiment": round(sentiment, 4),
                     "mentioned_tickers": [{"ticker": t, "sentiment": round(sentiment * np.random.uniform(0.5, 1.2), 4)}
                                           for t in np.random.choice(["SPY", "QQQ", "GLD", "TLT", "BTC", "AAPL", "MSFT", "NVDA"],
@@ -105,7 +105,7 @@ class PodcastScout(BaseAgent):
                          hypothesis_score, signal_direction, metadata)
                     VALUES
                         (:id, :source, :source_sub, :source_reliability,
-                         :timestamp::timestamptz, :sentiment, :mentioned_tickers,
+                         :timestamp, :sentiment, :mentioned_tickers,
                          :hypothesis_score, :signal_direction, :metadata)
                     """,
                     {

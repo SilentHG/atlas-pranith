@@ -25,6 +25,7 @@ import numpy as np
 from loguru import logger
 
 from atlas.core.agent_base import BaseAgent
+from atlas.core.serialization import safe_json_dumps
 
 
 class DriftDetectionEngine(BaseAgent):
@@ -385,7 +386,7 @@ class DriftDetectionEngine(BaseAgent):
                      retirement_candidates, retrain_recommendations,
                      metadata)
                 VALUES
-                    (:id, :detected_at::timestamptz, :feature_drift_score,
+                    (:id, :detected_at, :feature_drift_score,
                      :strategy_drift_score, :regime_drift_score,
                      :execution_drift_score, :composite_severity,
                      :n_strategies_monitored, :retirement_candidates,
@@ -400,9 +401,9 @@ class DriftDetectionEngine(BaseAgent):
                     "execution_drift_score": report["execution_drift"].get("drift_score", 0),
                     "composite_severity": report["composite_severity"],
                     "n_strategies_monitored": report["n_strategies_monitored"],
-                    "retirement_candidates": json.dumps(report["retirement_candidates"]),
-                    "retrain_recommendations": json.dumps(report["retrain_recommendations"]),
-                    "metadata": json.dumps({"method": "psi_and_trend_analysis"}),
+                    "retirement_candidates": safe_json_dumps(report["retirement_candidates"]),
+                    "retrain_recommendations": safe_json_dumps(report["retrain_recommendations"]),
+                    "metadata": safe_json_dumps({"method": "psi_and_trend_analysis"}),
                 },
             )
         except Exception as e:
@@ -423,7 +424,7 @@ class DriftDetectionEngine(BaseAgent):
                 "execution_drift_detected": report["execution_drift"].get("drift_detected", False),
                 "retirement_candidates": len(report["retirement_candidates"]),
             }
-            await self._redis.publish("drift_detection_updates", json.dumps(signal))
+            await self._redis.publish("drift_detection_updates", safe_json_dumps(signal))
         except Exception as e:
             logger.warning(f"{self.name}: publish failed: {e}")
 
@@ -437,6 +438,6 @@ class DriftDetectionEngine(BaseAgent):
                 "detected_at": datetime.utcnow().isoformat(),
                 "candidates": candidates,
             }
-            await self._redis.publish("retirement_candidate_updates", json.dumps(signal))
+            await self._redis.publish("retirement_candidate_updates", safe_json_dumps(signal))
         except Exception as e:
             logger.warning(f"{self.name}: retirement notification failed: {e}")

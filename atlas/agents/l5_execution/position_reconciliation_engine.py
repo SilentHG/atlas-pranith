@@ -153,8 +153,8 @@ class PositionReconciliationEngine(BaseAgent):
             VALUES
                 (:id, :trace_id, :leader_id, :follower_id,
                  'periodic', :n_checked, :n_mismatches,
-                 :exposure_delta, :pnl_delta, :repair_actions::jsonb,
-                 :recon_score, :metadata::jsonb, NOW())
+                 :exposure_delta, :pnl_delta, CAST(:repair_actions AS jsonb),
+                 :recon_score, CAST(:metadata AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],
@@ -241,7 +241,7 @@ class PositionReconciliationEngine(BaseAgent):
                  :l_exp, :f_exp,
                  :l_upnl, :f_upnl,
                  :l_rpnl, :f_rpnl,
-                 :sync_q, :metadata::jsonb, NOW())
+                 :sync_q, CAST(:metadata AS jsonb), NOW())
             """,
             {
                 "id": uuid.uuid4().hex[:16],

@@ -137,7 +137,7 @@ class KillSwitch(BaseAgent):
         await super().start()
 
     async def run(self):
-        # Start FastAPI
+        # Start FastAPI as background task so it doesn't block the run loop
         config = uvicorn.Config(app, host="0.0.0.0", port=8001, log_level="warning")
         server = uvicorn.Server(config)
         self._api_task = asyncio.create_task(server.serve())
@@ -146,17 +146,20 @@ class KillSwitch(BaseAgent):
         pubsub = self._redis.pubsub()
         await pubsub.subscribe(Channel.RISK_ALERTS.value)
         
-        while self.status == "running":
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message:
-                try:
-                    data = json.loads(message["data"])
-                    if data.get("type") == "limit_breach":
-                        reason = data.get("reason", "automated")
-                        await self.activate(reason)
-                except Exception as e:
-                    logger.error(f"Error parsing pubsub message: {e}")
-            await asyncio.sleep(0.1)
+        try:
+            while self.status == "running":
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message:
+                    try:
+                        data = json.loads(message["data"])
+                        if data.get("type") == "limit_breach":
+                            reason = data.get("reason", "automated")
+                            await self.activate(reason)
+                    except Exception as e:
+                        logger.error(f"Error parsing pubsub message: {e}")
+                await asyncio.sleep(0.1)
+        finally:
+            await pubsub.unsubscribe()
 
     async def stop(self):
         if self._api_task:

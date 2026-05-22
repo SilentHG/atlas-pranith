@@ -503,7 +503,7 @@ Output JSON array, each object:
                 VALUES
                     (:id, :trace_id, :statement, :observation_source, :testable_prediction,
                      :confidence, :evidence_count, :contradiction_count, :regime_scope,
-                     :replay_score, :decay_rate, :status, :evidence::jsonb, :metadata::jsonb,
+                     :replay_score, :decay_rate, :status, CAST(:evidence AS jsonb), CAST(:metadata AS jsonb),
                      :last_confirmed_at, NOW(), NOW())
                 """,
                 {

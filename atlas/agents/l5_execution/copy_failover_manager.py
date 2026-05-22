@@ -118,7 +118,7 @@ class CopyFailoverManager(BaseAgent):
                 VALUES
                     (:id, :trace_id, :fid, :lid, 'mode_transition',
                      :prev, :new, :trigger, :action,
-                     :meta::jsonb, NOW())
+                     CAST(:meta AS jsonb), NOW())
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],

@@ -10,7 +10,7 @@ Monitors Discord trading communities for:
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -68,7 +68,7 @@ class DiscordScout(BaseAgent):
                     "source": "discord",
                     "server": server,
                     "source_reliability": reliability,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc),
                     "sentiment": round(sentiment, 4),
                     "message_length": int(np.random.poisson(200)),
                     "mentioned_tickers": [{"ticker": t, "sentiment": round(sentiment * np.random.uniform(0.5, 1.2), 4)}
@@ -103,7 +103,7 @@ class DiscordScout(BaseAgent):
                          hypothesis_score, signal_direction, metadata)
                     VALUES
                         (:id, :source, :source_sub, :source_reliability,
-                         :timestamp::timestamptz, :sentiment, :mentioned_tickers,
+                         :timestamp, :sentiment, :mentioned_tickers,
                          :hypothesis_score, :signal_direction, :metadata)
                     """,
                     {

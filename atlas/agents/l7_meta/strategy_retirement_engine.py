@@ -322,7 +322,7 @@ class StrategyRetirementEngine(BaseAgent):
                      lifecycle_states, retirement_recommendations,
                      capital_withdrawal_signals, metadata)
                 VALUES
-                    (:id, :analyzed_at::timestamptz, :n_strategies_analyzed,
+                    (:id, :analyzed_at, :n_strategies_analyzed,
                      :n_active, :n_monitor, :n_retirement_pending, :n_retired,
                      :lifecycle_states, :retirement_recommendations,
                      :capital_withdrawal_signals, :metadata)

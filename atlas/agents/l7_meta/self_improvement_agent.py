@@ -59,8 +59,6 @@ class SelfImprovementAgent(BaseAgent):
     # MAIN LOOP
     # =========================================================
     async def run(self):
-        self.status = "running"
-
         while self.status == "running":
             try:
                 await self._analyze_and_feedback()

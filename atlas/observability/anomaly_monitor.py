@@ -61,7 +61,7 @@ class AnomalyMonitor:
                 INSERT INTO anomaly_observations
                     (id, observed_at, n_anomalies, anomalies, severity)
                 VALUES
-                    (:id, NOW(), :n_anomalies, :anomalies::jsonb, :severity)
+                    (:id, NOW(), :n_anomalies, CAST(:anomalies AS jsonb), :severity)
                 """,
                 {
                     "id": uuid.uuid4().hex[:16],
